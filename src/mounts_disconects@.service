@@ -1,0 +1,11 @@
+[Unit]
+Description=Stops all docker_user containers(docker_user@*.services), disconnects all mounts from raid.
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c "systemctl stop docker_user@%i.service"
+ExecStart=/bin/sh -c "sleep 5"
+ExecStart=-/bin/sh -c "ymount unmount --user=%i --unmount-all"
+
+[Install]
+WantedBy=default.target

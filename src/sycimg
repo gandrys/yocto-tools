@@ -1,0 +1,219 @@
+#!/bin/bash
+#====================================================================
+# NAME          :       ycimg
+# AUTHOR        :       Andrys Jiri
+# DATE          :       2017.10.31
+# VERSION       :       1.41
+# DEPENDENCIES:
+#               1)binaries: qemu-img, bash, egrep, mkdir, chmod, chown, id, grep, df
+#
+# DESCRIPTION   :
+#           Create raw image in order to use it as container for yocto environment
+#
+#  Version 1.4 :
+#   >New input parameters for bash mode 
+#    "--user="USERNAME"
+#    "--img-size-gb="IMAGE_SIZE_IN_GIGA_BYTES"
+#    "--img-path="IMAGE_PATH_AND_IMG_NAME_WITHOUT_EXTENSION"
+#====================================================================
+
+
+#Return first free loopdevice number of given user:
+#   @param  : [output]  :       $1                              loopdev_num_
+#   @ret    :                   if [ $? != 0 ]; then -> error
+get_freeloopdev_num() {
+
+  #/dev/mapper/loop1p1 on /mnt/jiri/vmware1
+  #mount | egrep "dev.*mapper.*loop.*${logged_user_name_}"
+  #test=/dev/mapper/loop1p1
+
+  local _first_loopdev_num=$(( ${LOOPDEV_START_OFFSET} + (${USER_LOOPDEV_MAX} * (${logged_user_id_} - ${LOWEST_USER_ID}))  ))
+  
+  for ((_j=0; _j<"${USER_LOOPDEV_MAX}";_j++ )); do
+    local _loopdev_num=$((${_first_loopdev_num}+${_j}))
+    local _isused=`sudo losetup -a | egrep "dev.*loop${_loopdev_num}:"`
+    if [ -z "${_isused}" ];then { local _ret=$1; eval $_ret=${_loopdev_num}; return 0; }; fi
+  done
+
+  #Error: any available loop devices for given user
+  local _ret="$1"; eval $_ret=""; return 1;
+}
+
+
+create_img() {
+
+  #We should not allow user to save to location who does not have right
+  sudo -u "${logged_user_name_}" qemu-img create -f raw -o size="$image_size_gb""G" "$img_dir""$img_name"".qemurawimg"
+  #TODO: err test
+  err_=$?
+  if [ "${err_}" != 0 ]; then
+   echo "Error: Image file. Exiting"
+   exit 1
+  fi
+  sudo chmod gu+r+w "$img_dir""$img_name"".qemurawimg"
+  sudo chown "${logged_user_name_}":root "$img_dir""$img_name"".qemurawimg"
+  echo ""
+
+  sleep 5
+
+  if [ ! -f "$img_dir""$img_name"".qemurawimg" ]; then
+    echo "Error: Unable to create image file. Exiting"
+    exit 1
+  fi
+
+  sudo losetup "/dev/loop""$freedev" "$img_dir""$img_name"".qemurawimg" 
+  sleep 3
+  sync
+  echo ""
+
+echo "w
+" | sudo fdisk "/dev/loop""$freedev"
+sync
+sleep 1
+sudo losetup -d "/dev/loop""$freedev"
+sync
+sleep 1
+
+sudo losetup "/dev/loop""$freedev" "$img_dir""$img_name"".qemurawimg"
+sync
+sleep 1
+echo ""
+
+echo "n
+p
+1
+
+
+w
+" | sudo fdisk "/dev/loop""$freedev"
+sync
+sleep 1
+sudo losetup -d "/dev/loop""$freedev"
+sync
+sleep 1
+
+sudo losetup "/dev/loop""$freedev" "$img_dir""$img_name"".qemurawimg"
+sync
+sleep 1
+echo ""
+
+sudo kpartx -a "/dev/loop""$freedev"
+sync
+sleep 2
+
+
+sudo mkfs.ext4 "/dev/mapper/loop""$freedev""p1"
+sync
+echo ""
+
+sleep 1
+
+sudo kpartx -d "/dev/loop""$freedev"
+sync
+sleep 2
+
+sudo losetup -d "/dev/loop""$freedev"
+sync
+sleep 5
+
+}
+
+main() {
+
+  DELIM="|-RAW_IMAGE-----------------------"
+
+  echo ""
+  echo "Creating yocto raw image:"
+  echo "$DELIM"
+  echo ""
+
+  get_freeloopdev_num "freedev"
+  ret="$?"
+  echo ""
+  if [ "${ret}" -eq 1 ]; then
+    echo '  Error: Any available loop devices for given user !'
+    echo '         Please unmount all your images by "ymount unmount" then run it again'
+    echo '         Exiting ' 
+    exit 1
+  fi
+  
+  if [ "${interactive_mode}" == "y" ]; then
+    echo "  Interactive Mode:"
+    
+    echo "  Enter the image size(number only) in units of GB(giga bytes): "
+    read -p "  >" image_size_gb
+    echo ""
+
+    echo "  Enter the name of image, without extention:  "
+    read -p "  >" img_name
+    echo ""
+
+    echo " Enter the directory of image"
+    read -e -p "  >" img_dir
+    echo ""  
+    
+    if [ -z "${img_dir}" ]; then 
+      echo "  Image will be created in current directory: "'"'$(pwd)'"'
+      img_dir=$(pwd)
+    fi
+    
+  else
+    echo "  Bash Mode:"
+  fi
+
+  
+  if [ ! -d "${img_dir}" ]; then
+    echo "   Error: Path does not exists!"
+    exit 1
+  else
+    #bug in df, in case that size on image is smaller than defined unit(-BX), then everytime show number 1 !!!
+    freespace=$(df -BK "$img_dir" | awk 'FNR>1{ print $4}')
+    #freeespace in KB
+    freespace_KB=${freespace::-1}
+    img_size_KB=$((${image_size_gb}*1000000))
+    echo -e "  Image size:\t ""$img_size_KB""KB"
+    echo -e "  Free space:\t ""$freespace_KB""KB\n"
+    if [ "${img_size_KB}" -gt "${freespace_KB}" ]; then
+      echo -e "\n  Error:Not enought free space for image in folder"
+      exit 1
+    fi
+  fi
+  
+  if [ ! "${img_dir: -1}" == "/" ]; then 
+    img_dir="${img_dir}""/"
+  fi
+
+  create_img
+  
+echo "$DELIM"
+echo ""
+
+}
+
+# INPUT PARAMETERS ==================================================================
+
+#Export settings from ymount
+#. ymount settings >/dev/null
+ymount_settings_arr=( $(/usr/local/bin/ymount settings) )
+eval "${ymount_settings_arr[@]}"
+
+#echo $LOOPDEV_START_OFFSET
+#echo $LOWEST_USER_ID
+#echo $USER_LOOPDEV_MAX
+
+# INPUT PARAMETERS ==================================================================
+
+logged_user_id_="$1"
+logged_user_name_="$2"
+image_size_gb="$3"
+img_name="$4"
+img_dir="$5"
+interactive_mode="$6"
+
+#echo "current"
+#id -un
+#echo "from params"./yc
+#echo "img_dir=$img_dir"
+#echo "logged_user_name_=$logged_user_name_"
+
+main

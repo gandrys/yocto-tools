@@ -1,0 +1,268 @@
+#!/bin/bash
+#====================================================================
+# NAME      :   ymount
+# AUTHOR    :   Andrys Jiri
+# DATE      :   2017.11.08
+# VERSION   :   0.2.5
+#
+# DEPENDENCIES:
+#               1) binaries: bash, grep, egrep, awk, mkdir, chmod, chown, 
+#                  losetup, kpartx, mount, id, smbstatus, smbcontrol
+#
+#               2) Path to Yocto image have to include username[xxxxxx] 
+#                  and image must have extention *.qemurawimg.
+#
+# DESCRIPTION:
+#             Script for mounting raw images with multi-user support.
+#             Without parameters, script will mount.
+#
+#
+#	Number of loop device is given by uid:
+#	 >first_loopdev_num=(uid-1000)*3
+#
+#	Every user have max 3 loop devices:
+#	 >uid=1000;first_loopdev_num=0;{0,1,2};
+#	 >uid=1001;first_loopdev_num=3;{3,4,5};
+#	 >uid=1002;first_loopdev_num=6;{6,7,8};
+#
+#	In order to access machine mounts easily by one cifs connection 
+#   and being able to work on multiple images at same time with less possible configuration,
+#   then every Yocto image is at first mounted to "/mnt/${user}/vdX" 
+#	and then that to "/opt/${user}/works"
+#
+#	Following folders have to exists in BuildMachine:
+#	>"/mnt/${user}/vd0", "/mnt/${user}/vd1", "/mnt/${user}/vd2"
+#	>"/opt/${user}/works"
+#
+#	Following folders have to exists in image due to secondary mount:
+#	>"/opt/${user}/works"
+#
+#	Tested on following Evironments:
+#	>Ubuntu 12.04 LTS, 14.04 LTS
+#	>Ubuntu 16.04 LTS
+#
+#	Version 0.2.1 :
+#	>Added function for detection of locked files by samba and samba session killing 
+#	>Added function for detection of local used files and offer to user to kill them
+#	>Added missing dependencies 
+#
+#	Version 0.2.2 :
+#   >1. Small changes in comments and source code 
+#   >2. Added script parameters:
+#   >"mount|mount=*|--mount=*|-m=*" 
+#     -> When added, script will mount image, parameter value includes path to image file. 
+#        In case of missing parameter value, script will ask for path to image file.
+#
+#   >"--no-opt-mount|--no-opt|-n" 
+#     -> When added, script will skip second mounting point to /opt/$USER/works.
+#        Parameter is applied only in case of mounting.
+#
+#   >"--mount-point-id=*|-i=*"
+#       When added, and if /mnt/$USER/vd${MOUNT_POINT_ID_NUMBER} is free then try to mount image to this point.
+#
+#	Version 0.2.3 :
+#   Bug in case of ubuntu 16.04: Unable to detect already mounted /opt/$USER/works.
+#   Minority changes in user prompts.
+#
+#   Version 0.2.4 :
+#   >1)prepare_dirs_in_image():Add support for multiple mounted images in case that current image do not have yocto folders
+#   >2)Added script parameters for docker services and also able to mount for any user as root with help of --user parameter:
+#   >"--user=*" 
+#       ->when added script suppose that interactive user input is disabled, 
+#         therefore all parameters have to be filed as input parameters of script
+#
+#   >"--mount-point-id=*|-i=*"
+#       ->used also in case of unmount 
+#   >3)Speed-up mount process instead of sleep add check loops waitforloopdev(), waitforfile()
+#
+#   Version 0.2.5 :
+#   >1)add support for --check-img-dirs in case of -n option for yocto tools and -n option
+#   >2)add support for --unmount-all
+#   >3)add new operation > settings,
+#                          print only settings and export to env LOOPDEV_START_OFFSET, LOWEST_USER_ID, USER_LOOPDEV_MAX
+#                          usefull for other tools ycimg and yocto
+#   >4)add new operation > info,
+#                          print mounted devices for given user
+#  Version 0.2.6 :
+#  >testing suid ...
+#====================================================================
+LOOPDEV_START_OFFSET=5
+LOWEST_USER_ID=1000
+USER_LOOPDEV_MAX=3
+IMAGE_DIR="/mnt"
+#========================================================
+
+help_desc () {
+echo -e "\
+
+Usage:  ymount OPERATION OPTIONS
+
+        where OPERATION = { mount | mount="PATH2IMAGE" | --mount="PATH2IMAGE" | -m="PATH2IMAGE" }
+
+                Mount drive to the following destinations:
+                   1)/mnt/USER_NAME/vdX, where X is mount point ID
+                   2)/opt/USER_NAME/works
+
+                where related OPTIONS are  = {--no-opt-mount | --no-opt | -n }
+                where related OPTIONS are  = {--check-img-dirs | -c },
+                                             valid only in case of --no-opt-mount
+                where related OPTIONS are  = {--mount-point-id="ID" | -i="ID" } 
+                where related OPTIONS are  = {--user="USERNAME" }
+
+
+        where OPERATION = { unmount }
+
+               where related OPTIONS are  = {--user="USERNAME" }
+               where related OPTIONS are  = {--mount-point-id="ID" | -i="ID" }
+               where related OPTIONS are  = {--unmount-all | --umount-all | -a }
+
+        where OPERATION = { settings }
+
+               Print settings:
+                 LOOPDEV_START_OFFSET, LOWEST_USER_ID, USER_LOOPDEV_MAX
+
+                 1)LOOPDEV_START_OFFSET
+                   Some other tools such as libvirt, qemu, wmware may use /dev/loop\$DEVICE_NUMBER devices.
+                   This variable is used as first loop device number for mounting.
+
+                 2)LOWEST_USER_ID
+                   Lowest user uid in system, usually 1000.
+
+                 3)USER_LOOPDEV_MAX
+                   Every user can mount at least USER_LOOPDEV_MAX images
+
+                 Example:
+                   ymount settings
+
+        where OPERATION = { info }
+"
+}
+
+# INPUT PARAMETERS ==================================================================
+
+path_to_img_file=""
+operation="mount"
+skip_opt_mount="n"
+mount_point_id=""
+runasuser=""
+ally_auto_mode=""
+check_img_dirs="n"
+unmount_all="n"
+#no_main_call="n"
+
+for arg in "$@"; do
+  case "$arg" in 
+    help|\?|--help|-h)
+      help_desc
+      exit 0;
+    ;;
+
+    mount|mount=*|--mount|--mount=*|-m=*)
+      operation="mount"
+      path_to_img_file="${arg#*=}"
+    ;;
+    --no-opt-mount|--no-opt|-n)
+      skip_opt_mount="y"
+    ;;
+    --check-img-dirs|-c)
+      check_img_dirs="y"
+    ;;
+    --mount-point-id=*|-i=*)
+      mount_point_id="${arg#*=}"
+    ;;
+
+    unmount|umount|--unmount|--umount )
+      operation="umount" 
+    ;;
+    --user=*)
+      runasuser="${arg#*=}"
+      ally_auto_mode="y"
+    ;;
+
+    --unmount-all|--umount-all|-a)
+      unmount_all="y"
+    ;;
+
+    settings)
+        echo "LOOPDEV_START_OFFSET=$LOOPDEV_START_OFFSET"
+        echo "USER_LOOPDEV_MAX=$USER_LOOPDEV_MAX"
+        echo "LOWEST_USER_ID=$LOWEST_USER_ID"
+        #export LOOPDEV_START_OFFSET
+        operation="settings"
+        #no_main_call="y"
+        exit 0;
+    ;;
+    info)
+        #export LOOPDEV_START_OFFSET
+        operation="info"
+    ;;
+
+  esac
+done
+
+# INPUT PARAMETERS ==================================================================
+
+#DEPENDENCIES_LIST=( "grep --help 0" "egrep --help 0" "awk --help 0" "mkdir --help 0" "chmod --help 0" \
+#                    "chown --help 0" "losetup --help 0" "kpartx --help 1" "mount --help 0" "id --help 0" \
+#                    "smbstatus --help 1" "smbcontrol --help 1" "lsof -h 0" )
+#dependencies_test
+#ret=$?
+#[ "${ret}" != "0" ] && exit 1
+
+if [ "$runasuser" == "" ]; then
+  if [ $(id -u) == 0 ]; then
+    echo " Error: Please run this command under normal user"
+    echo ""
+    exit 1
+  else
+    logged_user_id_=$(id -u)
+    logged_user_name_=$(id -un)
+  fi
+else
+
+  #TODO:If we do not have this we allow any user run symount as root>wrong, we have to kick out user from here
+  if [ $(id -u) != 0 ]; then
+    echo " Error: Please run this command as root"
+    echo ""
+    exit 1
+  fi
+
+  logged_user_id_=$(id -u "$runasuser")
+  logged_user_name_=$(id -un "$runasuser")
+  _ret=$?
+  if [ "$_ret" != "0" ]; then
+    echo " Error: User not found"
+    exit 1
+  fi
+
+fi
+
+
+if [ "${operation}" == "umount" ] && [ "${unmount_all}" == "y" ]; then
+
+ unmount_all="n"
+ for ((_k=0; _k<"${USER_LOOPDEV_MAX}";_k++ )); do
+   mount_point_id="${_k}"
+   sudo /usr/local/bin/symount "${LOOPDEV_START_OFFSET}" "${LOWEST_USER_ID}" "${USER_LOOPDEV_MAX}" "${IMAGE_DIR}" \
+                             "${operation}" "${path_to_img_file}" "${skip_opt_mount}" "${check_img_dirs}" "${mount_point_id}"\
+                              "${runasuser}" "${ally_auto_mode}" "${logged_user_id_}" "${logged_user_name_}"
+
+   _ret="$?"
+   if [ "${_ret}" != "0" ]; then
+     echo "Error: Unmount all. Exiting "
+     exit "${_ret}"
+   fi
+ done
+
+ exit 0
+fi
+
+
+#if [ "${no_main_call}" == "n" ]; then
+  #mainbash
+sudo /usr/local/bin/symount "${LOOPDEV_START_OFFSET}" "${LOWEST_USER_ID}" "${USER_LOOPDEV_MAX}" "${IMAGE_DIR}"\
+                            "${operation}" "${path_to_img_file}" "${skip_opt_mount}" "${check_img_dirs}" "${mount_point_id}"\
+                            "${runasuser}" "${ally_auto_mode}" "${logged_user_id_}" "${logged_user_name_}"
+_ret=$?
+exit ${_ret}
+#fi

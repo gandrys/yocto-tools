@@ -1,0 +1,13 @@
+[Unit]
+Description=Docker Socket for the API
+PartOf=docker_user@%i.service
+
+[Socket]
+EnvironmentFile=/home/%i/.config/docker_user/docker
+ListenStream=/home/%i/.config/docker_user/docker.sock
+SocketMode=0660
+SocketUser=root
+SocketGroup=docker
+
+[Install]
+WantedBy=sockets.target

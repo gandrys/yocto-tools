@@ -1,0 +1,8 @@
+[Unit]
+Description=Stops all docker_user containers(docker_user@*.services), disconnects all mounts from raid.
+
+[Timer]
+OnCalendar=*-*-* 22:45:00
+
+[Install]
+WantedBy=timers.target

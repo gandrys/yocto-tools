@@ -1,0 +1,3434 @@
+#!/bin/bash
+#====================================================================
+# NAME      :   yocto
+# AUTHOR    :   Andrys Jiri
+# DATE      :   2018.01.08
+# VERSION   :   0.66
+#
+# DEPENDENCIES :
+#               Binaries: bash, grep, egrep, awk, mkdir, chmod, chown, 
+#                         losetup, kpartx, mount, id, smbstatus, 
+#                         smbcontrol, docker, base64 
+#
+#
+# DESCRIPTION :
+#               Prepare environment for yocto and allows 
+#               to build with yocto in any environment.
+#
+#               It also allows separation of yocto evironments for different BSPs.
+#               Includes/install multi-user helper scripts:
+#                   /usr/local/bin/ycimg
+#                   /usr/local/bin/ymount
+#                   /usr/local/bin/umess.sh
+#
+#               Includes multi-user-docker_user* services/environment
+#               for systemd supported OS.
+#
+# TESTED ENV  :
+#               Windows 7 Professional"   32/64bit
+#               Ubuntu1604:               "builmachine mode(multi-user) mode", "single-user mode"
+#               Ubuntu1404:               "single-user mode"
+#               Fedora23:                 "single-user mode"
+#               Fedora24:                 "single-user mode"
+#
+#
+#
+#====================================================================
+
+tool_getver() {
+  local _ret=$1
+  local _LINK_TO_VERSION='https://raw.github.com/gandrys/yocto-tools/master/sources/version'
+
+  #local _LINK_TO_VERSION='https://raw.github.com/gandrys/trabla/master/src/bobek.b'
+  #wget in case of no error return 0,
+  #we have not to have local modificator in this case because retval value is gonna dissapear
+
+  _new_ver=$( wget -qO - "${_LINK_TO_VERSION}" )
+  errlev=$?;
+
+  #echo $errlev
+  #echo $_new_ver
+ 
+  eval ${_ret}="${_new_ver}"
+  return "${errlev}"
+ 
+}
+
+#return 1 if web_ver>loc_ver ===> update
+cmpver() {
+  local _loc=$1
+  local _web=$2
+  #version have only this format and have to have X.X only
+  #3.3212312312312<4.2
+  
+  local _loc_min="${_loc##*.}"
+  local _loc_maj="${_loc%%.*}"
+
+  local _web_min="${_web##*.}"
+  local _web_maj="${_web%%.*}"
+  
+  if [ "${_web_maj}" -gt "${_loc_maj}" ]; then
+    #update "${_web_maj}" > "${_loc_maj}"
+    return 1
+  else
+    #update "${_web_maj}" =< "${_loc_maj}"
+    if [ "${_web_maj}" -eq "${_loc_maj}" ]; then
+      # "${_web_maj}" == "${_loc_maj}"
+      #check minor
+      if [ "${_web_min}" -gt "${_loc_min}" ]; then
+        #update "${_web_min}" > "${_loc_min}"
+        return 1
+      else
+        return 0
+      fi
+      
+    else
+      #         2.343434    <   3.2
+      #update "${_web_maj}" < "${_loc_maj}"
+      #do nothing> working on new local ver
+      return 0
+    fi
+    
+  fi
+  
+}
+
+
+yocto_tools_update() {
+  local _update_dir=$1
+  local _LINK_TO_UPDATE="https://github.com/gandrys/yocto-tools.git"
+  echo -e "\n  Updating: \n"
+  
+  mkdir -p "${_update_dir}"
+  
+  local _bla=$(git clone "${_LINK_TO_UPDATE}" -C "${_update_dir}" )
+  local _ret=$?
+  if [ "${_ret}" != "0" ]; then 
+    echo -e "  Error: git clone ${_LINK_TO_UPDATE} -C ${_update_dir} "
+    exit 1 
+  fi
+  
+  yn="n"
+  echo -e "  \nInfo: Do you want to install docker services to support multi-user environment ? [y/n]"
+  read -p "        >" yn
+  if [ "$yn" == "y" ]; then 
+    "${_update_dir}/yocto" install --install-subsystem-files --install-services
+  else
+    "${_update_dir}/yocto" install --install-subsystem-files
+  fi
+
+}
+
+
+try2update() {
+
+
+  if [ "$(date +%u)" != "3" ]; then 
+    return 1
+  fi
+  
+  echo -e "\nChecking latest version:"
+  
+  tool_getver web_version
+  ret=$?
+  yn="n"
+  if [ "${ret}" != "0" ]; then  
+    echo -e "  Warning: Unable to check on-line version.\n"
+    return 1
+  fi
+  
+  cmpver "${VERSION}" "${web_version}"
+  ret=$?
+  if [ "${ret}" -eq "1" ]; then 
+     echo -e "\nWarning: New version of yocto-tools is available."
+     echo -e "         Do you want to install new yocto-tools, version ${new_version} [y/n]"
+     read -p "         >" yn
+  fi
+  
+  if [ "${yn}" == "y" ]; then  
+    UPDATE_DIRECTORY="${YOCTO_DOCKER_CONFIG_DIR}/update_${new_version}" ]
+    
+    yocto_tools_update "${UPDATE_DIRECTORY}"
+    
+    for up_dir in "${YOCTO_DOCKER_CONFIG_DIR}/update_"*; do
+     [ "${up_dir##*_}" == "${new_version}"* ] && continue
+     
+     #no one wanna delete whole drive .... 
+     if [[ "${up_dir}" == *"yocto_docker"* ]]; then
+      rm -rf "${up_dir}"
+     fi
+    done
+    
+    exit 0
+  fi
+
+}
+
+
+
+
+
+#In case of Fedora and enabled SeLinux we are not able to mount image to docker 
+selinux_mnt_enable(){
+
+  local _rettxt
+  local _ret
+  _rettxt=$(sestatus 2>/dev/null)
+  _ret=$?
+  local _iscontext=$(ls -dZ /mnt/${USER_NAME_HOST}/vd0/opt | grep "svirt_sandbox_file_t" )
+  
+  if [ "${_ret}" == "0" ] && [ -z "${_iscontext}" ]; then
+    echo -e "\n  SElinux: Changing Context\n"
+    ${sudo} chcon -Rt svirt_sandbox_file_t /mnt/${USER_NAME_HOST}/vd0/opt
+  fi
+}
+
+dependencies_test() {
+  #format: all commands here are in format "CMDNAME SOME_PARAMETERS RETURN_VALUE"
+
+   for cmd in "${DEPENDENCIES_LIST[@]}"; do 
+    #
+    sub_cmd_arr=( ${cmd} )
+    lst="${#sub_cmd_arr[@]}"
+    sub_cmd="${sub_cmd_arr[@]:0:lst-1}"
+    cmd_only=${sub_cmd_arr[0]}
+    exp_retval="${sub_cmd_arr[@]: -1}"
+    #
+    
+    if [ "${OS_STRING}" != "NATIVE_LINUX" ]; then
+      isnativekrncmd=$(echo "${cmd_only}" | egrep "(docker|losetup|kpartx|mount|smbstatus|smbcontrol|qemu-img|mkfs.ext4|fdisk)" )
+      [ ! -z "${isnativekrncmd}" ] && continue
+    fi
+    
+    retval=$( ${sub_cmd} &>/dev/null)
+    retval=$?
+    if [ "${retval}" != "${exp_retval}" ] && [ "${retval}" != "0" ]; then
+      echo -e "  Error: Dependencies test fail !"
+      echo -e '         "'$sub_cmd'" command should return 0 or "'$exp_retval'"'"\n         but returned value is "'"'$retval'"!' 
+      return 1
+    fi
+   done
+
+  return 0
+}
+
+
+get_base_image_archive(){
+  local _yocto_base_docker_file=$1
+  #/bla/bla/ubuntu1404_yocto_base_dependencies.v2.docker"
+  #dir=/new_dir
+  #ret=/new_dir/ubuntu1404_yocto_base_dependencies.v2.docker.tar.bz2
+  local _ret=$2
+
+  local _bla="${_yocto_base_docker_file##*/}"
+  _arch="${_bla}.tar.bz2"
+
+  eval "${_ret}"="${_arch}"
+}
+
+get_base_image_archive_path(){
+  local _temp_inst_dir=$1
+  local _yocto_base_docker_file=$2
+  #/bla/bla/ubuntu1404_yocto_base_dependencies.v2.docker"
+  #dir=/new_dir
+  #ret=/new_dir/ubuntu1404_yocto_base_dependencies.v2.docker.tar.bz2
+  local _ret=$3
+
+  get_base_image_archive "${_yocto_base_docker_file}" _blabla
+
+  _arch="${_temp_inst_dir}/${_blabla}"
+
+  eval "${_ret}"="${_arch}"
+}
+
+
+get_image_name(){ 
+  local _path2docker_file=$1
+  local _user=$2
+  #DockerFile should be in this format
+  #/bla/bla/ubuntu1404_yocto_base_dependencies.v2.docker"
+  #$distro_function.{TAG}.docker
+  #ret=gandrys/ubuntu1404_yocto_base_dependencies:v2
+  local _ret=$3
+  
+  local _img_name=${_path2docker_file##*/}
+  _img_name=${_img_name%.*}
+  _img_name=${_img_name/./:}
+  _img_name="${_user}/${_img_name}"
+  
+  eval "${_ret}"="${_img_name}"
+}
+
+get_container_name() { 
+  local _path2docker_file=$1
+  local _user=$2
+  #DockerFile should be in this format
+  #/bla/bla/ubuntu1404_yocto_base_dependencies.v2.docker"
+  #$distro_function.{TAG}.docker
+  #img_name=gandrys/ubuntu1404_yocto_base_dependencies:v2
+  #ret=gandrys_ubuntu1404_yocto_base_dependencies_v2
+  local _ret=$3
+  
+  local _img_name=${_path2docker_file##*/}
+  _img_name=${_img_name%.*}
+  _img_name=${_img_name/./:}
+  _img_name="${_user}/${_img_name}"
+  
+  _container_name="${_img_name////_}"
+  _container_name="${_container_name/:/_}"
+  
+  eval "${_ret}"="${_container_name}"
+}
+
+docker_build_yocto_user_image() {
+  local _dcmd=$1
+  local _user_image_name=$2
+  local _user_image_uid=$3
+  local _user_image_gid=$4
+  
+  DOCKER_YOCTO_BUILD_PARAMS=" --build-arg USER_NAME=${_user_image_name} \
+                              --build-arg USER_UID=${_user_image_uid} \
+                              --build-arg USER_GID=${_user_image_gid} \
+                              -f ${YOCTO_USER_DOCKER_FILE} \
+                              -t ${DOCKER_YOCTO_USER_IMG_NAME} \
+                               ${DOCKER_BUILD_DIRECTORY} "
+
+  if [ "${OS_STRING}" != "NATIVE_LINUX" ]; then
+    DOCKER_YOCTO_BUILD_PARAMS=" --build-arg USER_NAME=${_user_image_name} \
+                              --build-arg USER_UID=${_user_image_uid} \
+                              --build-arg USER_GID=${_user_image_gid} \
+                              -f $(cygpath -aw ${YOCTO_USER_DOCKER_FILE}) \
+                              -t ${DOCKER_YOCTO_USER_IMG_NAME} \
+                               $(cygpath -aw ${DOCKER_BUILD_DIRECTORY}) "
+  fi
+                               
+  "${_dcmd}" build ${DOCKER_YOCTO_BUILD_PARAMS}
+  return $?
+}
+
+docker_identify() {
+  local _ret=$1
+  local _dcmd
+
+  is_docker_user=""
+  #{ normal docker or multisession docker ?
+  if [ "${OS_STRING}" = "NATIVE_LINUX" ]; then
+    is_docker_user="$(systemctl is-enabled docker_user@${USER_NAME_HOST}.service 2>/dev/null | grep enabled)"
+  fi
+
+  if [ -z "$is_docker_user" ]; then
+
+    echo -e "  Info: The "'"'docker_user'"' " tools not found, docker will be used.\n"
+    _dcmd="docker"
+    #{ Is daemon running ?
+    tst=$("${_dcmd}" ps); ret=$?
+    if [ "$ret" != "0" ]; then
+     echo -e "  Error: Please start service by command: \n         $ sudo systemctl start docker.service"; return 1
+    fi
+    #}
+  else
+    _dcmd="docker_user"
+    #{ Is daemon running ?
+    tst=$("${_dcmd}" ps); ret=$?
+    if [ "$ret" != "0" ]; then 
+      echo -e "  Error: Please start service by command: \n         $ sudo systemctl start docker_user@${USER_NAME_HOST}.service"; return 1
+    fi
+    #}
+  fi
+  #}  
+  
+  eval "$_ret"=$_dcmd
+}
+
+
+cygwin_vbox_yocto_image_mount() {
+  
+    yn="n"
+    #is yocto environment/image set in virtbox settings ?
+    issetyoctoimg_in_docker_machine=$("${VBOXMANAGE}" showvminfo "${VBOX_DOCKER_MACHINE_NAME}" --machinereadable | egrep "SATA-5-0.*\=.*none")
+    if [ ! -z "${issetyoctoimg_in_docker_machine}" ]; then
+      #img is notset ...ask to path to y image
+      yn="y"
+    else
+      curr_img="$("${VBOXMANAGE}" showvminfo "${VBOX_DOCKER_MACHINE_NAME}" --machinereadable | egrep "SATA-5-0.*\=")"
+      curr_img="${curr_img##*=}"
+      echo -e '  Info: Do you want to mount different image than: "'"${curr_img}"'" ?''[y/n]'
+      read -e  -p "  >" yn
+      echo -e "\n\n"
+    fi  
+    
+    if [ "$yn" == "y" ]; then
+    
+      echo -e "\n  Please enter the path to the yocto-image file:"
+      read -e  -p "  >" path_to_img_file
+
+      if [ ! -f "$path_to_img_file" ] || [ -z "$path_to_img_file" ]; then
+        echo -e "\n  Error: Image file not found !"
+        return 1
+      fi
+
+      #vbox need to have *.hdd extension ...vbox is not reading real header of img-file 
+      israwimg=`echo "$path_to_img_file" | grep -E "\..*raw"`
+      if [ ! -z "$israwimg" ]; then
+        yn="n"
+        echo -e "\n  VirtualBox image have to have *.hdd extension!\n  Do you want to rename image ?[y/n]"
+        read -e  -p "  >" yn
+        if [ "$yn" == "y" ]; then
+          new_img_name="${path_to_img_file%%.*}.hdd"
+          mv "${path_to_img_file}" "${new_img_name}"
+          sleep 1
+          path_to_img_file="${new_img_name}"
+        else 
+          return 1
+        fi
+            
+      fi
+  
+      echo -e "\n\n"
+      bla=$(docker-machine stop "${VBOX_DOCKER_MACHINE_NAME}" )
+      sleep 0.5
+      
+      win_img_path=$(cygpath -aw "${path_to_img_file}" )
+      #set image file
+      bla=$("${VBOXMANAGE}" storageattach "${VBOX_DOCKER_MACHINE_NAME}" --storagectl "SATA" --port 5 --device 0 --type "hdd" --medium "${win_img_path}" )
+      sleep 0.5
+      
+    fi 
+    
+    docker-machine start "${VBOX_DOCKER_MACHINE_NAME}"
+    sleep 0.5
+    eval $(docker-machine env "${VBOX_DOCKER_MACHINE_NAME}")
+    sleep 0.5
+    #volumes are persistent, after docker machine restart 
+    bla=$(docker-machine ssh docker volume rm "${VBOX_YOCTO_VOLUME_NAME}" )
+    
+    #in case that we will not restart docker machine, mount point will remain, now we try to unmount
+    bla=$(docker-machine ssh "${VBOX_DOCKER_MACHINE_NAME}" "sudo umount /mnt/sdb1" &>/dev/null)
+    sleep 0.5
+    echo -e "\n\n"
+    
+    
+    bla=$(docker-machine ssh "${VBOX_DOCKER_MACHINE_NAME}" "sudo mount /dev/sdb1")
+    ret=$?
+    if [ "${ret}" != "0" ]; then
+      echo -e "\n  Error: Unable to mount Yocto image in docker-machine!\n "
+      echo -e "         Press Enter to continue"
+      read 
+      return 1
+    fi
+      
+    user_name_image=$(docker-machine ssh "${VBOX_DOCKER_MACHINE_NAME}" "ls /mnt/sdb1/opt/" 2>/dev/null)
+    ret1=$?
+    worksdir=$(docker-machine ssh "${VBOX_DOCKER_MACHINE_NAME}" "ls /mnt/sdb1/opt/${user_name_image}/" 2>/dev/null)
+    ret2=$?
+    if [ "$ret1" != "0" ] || [ "$ret2" != "0" ] || [ -z "${user_name_image}" ] || [ -z "${worksdir}" ] ; then
+      echo -e "\n  Error: Image does not have necessary directory structure! \n"
+      echo -e "         Press Enter to continue"
+      read 
+      return 1
+    fi
+    
+    bla=$(docker-machine ssh "${VBOX_DOCKER_MACHINE_NAME}" "docker volume create --name ${VBOX_YOCTO_VOLUME_NAME} --opt type=none --opt device=/mnt/sdb1/opt --opt o=bind ")
+    ret=$?
+    if [ "${ret}" != "0" ]; then
+      echo -e "\n  Error: Unable to create docker volume !\n "
+      echo -e "         Press Enter to continue"
+      read 
+      return 1
+    fi
+    
+    return 0
+}
+
+#yocto image with yocto env is not mounted within local win system, 
+#but it will be directly mounted  within docker-machine 
+cygwin_vbox_yocto_image_mount_test() {
+  local _ret_image_user_name=$1
+  local _ret_image_user_uid=$2
+  local _ret_image_user_gid=$3
+  
+  while true; do
+    cygwin_vbox_yocto_image_mount
+    ret=$?
+    if [ "${ret}" != "0" ]; then
+      echo -e "\n\n"
+      continue
+    else
+      break;
+    fi
+  done
+  eval $(docker-machine env "${VBOX_DOCKER_MACHINE_NAME}")
+  
+  tmp=$(docker-machine ssh "${VBOX_DOCKER_MACHINE_NAME}" "ls /mnt/sdb1/opt/" 2>/dev/null)
+  eval "${_ret_image_user_name}"="${tmp}"
+  
+  tmp=( $(docker-machine ssh "${VBOX_DOCKER_MACHINE_NAME}" "ls -lnd /mnt/sdb1/opt/${tmp}" 2>/dev/null) )
+  eval "${_ret_image_user_uid}"="${tmp[2]}"
+  eval "${_ret_image_user_gid}"="${tmp[3]}"
+  
+}
+
+
+#multiple user directories in /mnt/${USER_NAME_HOST}/vd0/opt are not supproted !!!
+yocto_image_mount_test() {
+  local _ret_image_user_name=$1
+  local _ret_image_user_uid=$2
+  local _ret_image_user_gid=$3
+  
+  while true; do
+    ismounted=$(mount | egrep "dev.*mapper.*loop.*p1.*on.*mnt.*${USER_NAME_HOST}.*vd0" )
+    if [ -z "${ismounted}" ]; then
+      echo -e "  Error: Please mount yocto image first by command:\n       ymount -i=0"
+      echo -e "         Do you want mount image by "'"''ymount''"'" tool and find yocto image ?[y/n]"
+      read -p "         >" yn
+      if [ "$yn" == "y" ]; then 
+       ${YOCTO_IMAGE_MOUNT_COMMAND_NO_OPT}
+       ret=$?
+       [ "$ret" != "0" ] && continue
+      else
+        exit 1
+      fi
+    fi
+    
+    #Fresh and un-prepared image ?
+    #-> if yes, call YOCTO_IMAGE_MOUNT_COMMAND without -n parameter, therefore allow detection of
+    #empty image and creation of directories in image by ymount tool
+    tmp=$(ls /mnt/${USER_NAME_HOST}/vd0/opt 2>/dev/null)
+    ret=$?
+    if [ "$ret" != "0" ] || [ -z "${tmp}" ] ; then
+      echo -e "\n  Error: Image does not have necessary directory structure,\n         ymount tool will be called again with different parameters. "
+      echo -e "         Press Enter to continue"
+      read -p "         >" 
+      ${YOCTO_IMAGE_MOUNT_COMMAND_NO_OPT} unmount
+      sleep 5
+      echo -e "\n--"
+      ${YOCTO_IMAGE_MOUNT_COMMAND}
+      ret=$?
+      [ "$ret" != "0" ] && continue
+    fi
+    break
+  done  
+  
+  tmp=$(ls /mnt/${USER_NAME_HOST}/vd0/opt 2>/dev/null)
+  eval "${_ret_image_user_name}"="${tmp}"
+  
+  tmp=( $(ls -lnd /mnt/${USER_NAME_HOST}/vd0/opt 2>/dev/null) )
+  eval "${_ret_image_user_uid}"="${tmp[2]}"
+  eval "${_ret_image_user_gid}"="${tmp[3]}"
+    
+}
+
+select_file() {
+  local _ftype=$1
+  local _searchdir=$2
+  local _ret_selected=$3
+
+  echo -e "\n  Available files:"
+
+  i=0
+  for fle in "${_searchdir}"/$_ftype; do
+    [ ! -f "${fle}" ] && continue
+    flearr+=("${fle}")
+    echo "    [$i] :""${fle}"
+    i=$((i+1))
+  done
+
+  echo "  Please select file number:"
+  read  -p "  >" selected
+  eval "${_ret_selected}"="${flearr[$selected]}"
+  echo -e "  >"'"'"${flearr[$selected]##*/}"'"'
+  echo -e "  --\n"
+
+}
+
+#This function take a look to "from" field in yocto_user_docker_file and return yocto_base_docker_filepath in docker_files_dir
+get_yocto_base_docker_file(){
+  local _yocto_user_docker_file=$1
+  local _yocto_docker_files_dir=$2
+  local _ret=$3
+
+  #$2=gandrys/ubuntu14045_yocto_base:v5
+  _tmp_dckrfile_from=$(awk '{if($1=="FROM"){print $2; }}' "${_yocto_user_docker_file}")
+  #cut name
+  _tmp0="${_tmp_dckrfile_from##*/}"
+  #get version
+  _dckrimgver=${_tmp_dckrfile_from##*:}
+  _yocto_usr_img_flename="${_tmp0%:*}.${_dckrimgver}.docker"
+
+  #delete last slash
+  _yocto_docker_files_dir="${_yocto_docker_files_dir%/}"
+
+  _yct_base_img_filepath=""
+  #search for file in directory
+  if [ -e "${_yocto_docker_files_dir}/${_yocto_usr_img_flename}" ]; then
+    _yct_base_img_filepath="${_yocto_docker_files_dir}/${_yocto_usr_img_flename}"
+  fi
+
+  eval "${_ret}"="${_yct_base_img_filepath}"
+}
+
+yocto_run() {
+  local _yocto_user_docker_file=$1
+  local _yocto_docker_files_dir=$2
+  local _yocto_tmp_install_dir=$3
+
+  YOCTO_USER_DOCKER_FILE="${_yocto_user_docker_file}"
+  echo -e "Yocto : \n"
+
+  get_yocto_base_docker_file "${_yocto_user_docker_file}" "${_yocto_docker_files_dir}" YOCTO_BASE_DOCKER_FILE
+
+  if [ "${OS_STRING}" != "NATIVE_LINUX" ]; then
+    cygwin_vbox_yocto_image_mount_test USER_NAME_IMAGE USER_UID_IMAGE USER_GID_IMAGE
+  else
+    yocto_image_mount_test USER_NAME_IMAGE USER_UID_IMAGE USER_GID_IMAGE
+  fi
+
+  echo -e "  IMAGE_USER_NAME : ${USER_NAME_IMAGE}"
+  echo -e "  IMAGE_USER_UID  : ${USER_UID_IMAGE}"
+  echo -e "  IMAGE_USER_GID  : ${USER_GID_IMAGE}\n"
+
+  echo -e "  DOCKER_FILES    : ${YOCTO_USER_DOCKER_FILE##*/}->${YOCTO_BASE_DOCKER_FILE##*/}\n"
+  #echo -e "  YOCTO_BASE_DOCKER_FILE=${YOCTO_BASE_DOCKER_FILE}"
+  #echo -e "  YOCTO_USER_DOCKER_FILE=${YOCTO_USER_DOCKER_FILE}"
+
+  get_image_name "${YOCTO_BASE_DOCKER_FILE}" "gandrys" DOCKER_YOCTO_BASE_IMG_NAME
+  get_image_name "${YOCTO_USER_DOCKER_FILE}" "${USER_NAME_IMAGE}" DOCKER_YOCTO_USER_IMG_NAME
+  get_container_name "${YOCTO_USER_DOCKER_FILE}" "${USER_NAME_IMAGE}" DOCKER_YOCTO_USER_CONTAINER_NAME
+
+  #docker_YOCTO_BASE archives files(*.tar.bz2) exist in docker temp file (_yocto_tmp_install_dir)
+  #These archives files(*.tar.bz2) are always temporary and are removed  after load to docker "filesystem"
+  get_base_image_archive_path "${_yocto_tmp_install_dir}" "${YOCTO_BASE_DOCKER_FILE}" YOCTO_BASE_IMAGE_FILE
+
+  #{ normal docker or multisession docker ?
+  docker_identify dcmd
+  ret=$?
+  [ "${ret}" != "0" ] && return 1
+  
+  #ng_path:container->user_image->base_image->archive_base_image->error
+
+  if [ "${OS_STRING}" == "NATIVE_LINUX" ]; then
+   selinux_mnt_enable
+  fi
+  
+  
+  DOCKER_YOCTO_RUN_PARAMS=" --rm -t -i -e DISPLAY \
+                            -v /mnt/${USER_NAME_HOST}/vd0/opt:/opt \
+                            -v /tmp/.X11-unix:/tmp/.X11-unix \
+                            -v /home/${USER_NAME_HOST}/.Xauthority:/home/${USER_NAME_IMAGE}/.Xauthority \
+                            --name ${DOCKER_YOCTO_USER_CONTAINER_NAME} \
+                            --user ${USER_NAME_IMAGE} \
+                            ${DOCKER_YOCTO_USER_IMG_NAME} \
+                             /bin/bash"
+
+
+  #due to remote access and virtual X11 displays x11 disp id is changing,
+  #moreover user can run env from ssh or from gui and DISPLAY variable is not set in case of ssh,
+  #therefore, we need always run docker run -e DISPLAY
+  #first_yocto_run=$("$dcmd" ps -a |  egrep "${DOCKER_YOCTO_USER_CONTAINER_NAME}")
+
+  #if [ -z "$first_yocto_run" ]; then
+
+    #check if docker_YOCTO_USER image exist user/XX_docker_user:vX
+    docker_yocto_user_img=$("$dcmd" images | egrep "${DOCKER_YOCTO_USER_IMG_NAME%:*}".*"${DOCKER_YOCTO_USER_IMG_NAME#*:}")
+    if [ -z "$docker_yocto_user_img" ]; then
+
+      #check if docker_YOCTO_BASE image exist user/XX_docker_user:vX
+      docker_yocto_base_img=$("$dcmd" images | egrep "${DOCKER_YOCTO_BASE_IMG_NAME%:*}".*"${DOCKER_YOCTO_BASE_IMG_NAME#*:}")
+      if [ -z "$docker_yocto_base_img" ]; then
+
+        #check if docker_YOCTO_BASE archive file(*.tar.bz2) exist in docker temp file
+        if [ ! -e "${YOCTO_BASE_IMAGE_FILE}" ]; then
+          echo -e "\n\nWarning: Tar.bz2 archive ${YOCTO_BASE_IMAGE_FILE} does not exist.\n         Create Yocto Base Image?[y/n]"
+          read -p "        >" yn
+          if [ "$yn" == "y" ]; then
+            create_docker_image_archive_yocto_base "${YOCTO_BASE_DOCKER_FILE}" "${YOCTO_BASE_IMAGE_FILE}" "${DOCKER_YOCTO_BASE_IMG_NAME}" "${DOCKER_BUILD_DIRECTORY}"
+            ret=$?
+            [ "$ret" != "0" ] && return 1
+            echo ""
+          else 
+            echo -e "Exiting"
+            return 1
+          fi
+        fi
+        
+        #if only tar exist skip Decompression
+        if [ ! -f "${YOCTO_BASE_IMAGE_FILE%.bz2*}" ]; then
+         #tar does not exist ...> decompress
+          echo -e "  Docker Base Yocto Image: Decompression  \n"
+          echo -e "    Press ENTER to continue : "
+          read -p "    >" 
+          #remove original tar.bz2 archive automatically 
+          bunzip2 -fvv "${YOCTO_BASE_IMAGE_FILE}"
+          ret=$?
+          if [ "${ret}" != "0" ]; then 
+            echo -e "\n\nError: Decompression of ${YOCTO_BASE_IMAGE_FILE} failed !"
+            return 1
+          fi 
+        fi
+        
+        echo -e "  Docker Base Yocto Image: docker load "${YOCTO_BASE_IMAGE_FILE%.bz2*}"  \n"
+        echo -e "    Press ENTER to continue : "
+        read -p "    >"         
+        if [ "${OS_STRING}" != "NATIVE_LINUX" ]; then
+          "${dcmd}" load -i $(cygpath -aw "${YOCTO_BASE_IMAGE_FILE%.bz2*}" )
+          ret=$?
+        else
+          "${dcmd}" load -i "${YOCTO_BASE_IMAGE_FILE%.bz2*}"
+          ret=$?
+        fi
+
+        if [ "${ret}" == "0" ]; then 
+          #remove tar archive after proper load
+          rm "${YOCTO_BASE_IMAGE_FILE%.bz2*}"
+        fi 
+        
+        echo -e "\n\n"
+      fi
+      
+      echo -e "  Docker Build User Yocto Image: \n"
+      echo -e "  Virtual environment will be created, press ENTER to continue : "
+      read -p "  >" 
+      docker_build_yocto_user_image "${dcmd}" "${USER_NAME_IMAGE}" "${USER_UID_IMAGE}" "${USER_GID_IMAGE}"
+    fi
+    
+    
+    #check if container exist -a param is necessary(all containers) 
+    cntexist=$("${dcmd}" ps -a -f name="${DOCKER_YOCTO_USER_CONTAINER_NAME}" -q)
+    if [ ! -z "${cntexist}" ]; then
+      #container exist > running ? -> delete ?
+      
+      #check if container is running
+      cntisrunning=$("${dcmd}" ps -f name="${DOCKER_YOCTO_USER_CONTAINER_NAME}" -f status=running -q )
+      if [ ! -z "${cntisrunning}" ]; then
+        #container is running
+        echo -e "\n\n  Warning: Container ${DOCKER_YOCTO_USER_CONTAINER_NAME} is running ! "
+        echo -e "         Do you want to stop this container ? [y/n]"
+        read -p "         >" yn
+      
+        if [ "$yn" = "y" ]; then
+          bla=$("${dcmd}" stop "${DOCKER_YOCTO_USER_CONTAINER_NAME}")
+        else
+          echo -e "Exiting"
+          return 1
+        fi
+      fi
+      
+      
+      echo -e "\n\n  Warning: Container "'"'${DOCKER_YOCTO_USER_CONTAINER_NAME}'"' " should not exist."
+      echo -e "         Do you want to delete this container ? [y/n]"
+      read -p "         >" yn
+      if [ "$yn" = "y" ]; then
+        bla=$("${dcmd}" rm "${DOCKER_YOCTO_USER_CONTAINER_NAME}")
+      else
+        echo -e "Exiting"
+        return 1
+      fi
+      
+    fi
+    
+    echo -e "  Info: Docker run \n"
+    
+    if [ "${OS_STRING}" != "NATIVE_LINUX" ]; then
+      DOCKER_YOCTO_RUN_PARAMS=" --rm -t -i -e DISPLAY \
+                                -v ${VBOX_YOCTO_VOLUME_NAME}:/opt \
+                                --name ${DOCKER_YOCTO_USER_CONTAINER_NAME} \
+                                --user ${USER_NAME_IMAGE} \
+                                ${DOCKER_YOCTO_USER_IMG_NAME} "  
+
+      #cygstart and cmd is necessary here due to cygwin's terminal which do not support full posix tty 
+      echo -e "\n  Info: Run in separate window"
+      
+      cygstart cmd /C "${dcmd} run ${DOCKER_YOCTO_RUN_PARAMS}"
+    else
+      "${dcmd}" run ${DOCKER_YOCTO_RUN_PARAMS}
+    fi
+    
+  #else
+  #  echo -e "  Info: $ Docker start ${DOCKER_YOCTO_USER_CONTAINER_NAME} \n"
+  #  "${dcmd}" start -ai ${DOCKER_YOCTO_USER_CONTAINER_NAME}
+  #fi
+  #}
+
+}
+
+
+update_script_data() {
+  local _files=$1
+  local _src_dir=$2
+  declare -a _instfiles=( $_files )
+  _src_dir="${_src_dir%/}"
+  if [ ! -z "$_src_dir" ]; then
+    _src_dir="${_src_dir}""/"
+  fi
+
+  awk '{print $0; if( $0 == "BASE64_DATA_FILES:" ){exit} }' ${fname} > ${release_fname}
+
+  echo -e "Update file: "
+  for fle in ${_instfiles[@]}; do
+    echo -e "  File: ${fle##*/}"
+    src_file="${_src_dir}""${fle##*/}"
+
+    if [ -f ${src_file} ]; then
+    
+      if [ "${fle}" == "${YOCTO_BASE_IMAGE_FILE}" ] && [ "${ADD_BASE_IMAGE}" == "no" ] ; then
+        echo "    >skip"
+        echo -e "SKIP:" >>"${release_fname}"
+        echo -e "" >>"${release_fname}"
+        continue      
+      fi
+      
+      echo "    >OK"
+      
+      fle_encoded=$(base64 ${src_file})
+      echo -e "${fle_encoded}" >>"${release_fname}"
+      echo -e "" >>"${release_fname}"
+    else
+      if [ "${fle}" == "${YOCTO_BASE_IMAGE_FILE}" ] && [ "${ADD_BASE_IMAGE}" == "no" ] ; then
+        echo "    >skip"
+        echo -e "SKIP:" >>"${release_fname}"
+        echo -e "" >>"${release_fname}"
+        continue
+      fi
+    
+      echo "     >Error: File not found" 
+      exit 1
+    fi
+    
+  done
+  
+}
+
+
+#for release phase
+#all files should be in current directory,
+# docker files will be
+update_script_data2() {
+  local _base_release_files=$1
+  local _src_dir=$2
+  local _docker_build_dir=$3
+  local _tmp_install_dir=$4
+
+  #this var includes only base files(ymount, ycimg. etc), docker files and docker archived images are not listed here
+  #we will search current directory for docker files and docker archived images
+  declare -a _arr_base_release_files=( ${_base_release_files} )
+
+  #"">./
+  #"./">"./"
+  #"/">"/"
+  if [ -z "$_src_dir" ]; then
+    _src_dir="./"
+  else
+    _src_dir="${_src_dir%/}"
+    _src_dir="${_src_dir}""/"
+  fi
+
+  awk '{print $0; if( $0 == "BASE64_DATA_FILES:" ){exit} }' ${fname} > ${release_fname}
+
+  echo -e "Adding static files: "
+  for fle in ${_arr_base_release_files[@]}; do
+    echo -e "  File: ${fle##*/}"
+    src_file="${_src_dir}""${fle##*/}"
+
+    if [ -f ${src_file} ]; then
+      fle_encoded=$(base64 ${src_file})
+      echo "    >OK"
+      echo -e "${fle}" >>"${release_fname}"
+      echo -e "${fle_encoded}" >>"${release_fname}"
+      echo -e "" >>"${release_fname}"
+    else
+      echo "     >Error: File not found"
+      exit 1
+    fi
+  done
+
+  echo -e "\n\nAdding dynamic files: "
+  echo -e "\n  Searching docker files:"
+  #search only *.docker files and will not list *.docker.tar.bz2 files
+  for fle in "${_src_dir%/}"/*".docker"; do
+    [ ! -f "${fle}" ] && continue
+    dckr_file_path="${_docker_build_dir}/${fle##*/}"
+    echo -e "    File: ${fle##*/}"
+    fle_encoded=$(base64 ${fle})
+    echo -e "      >OK"
+    echo -e "${dckr_file_path}" >>"${release_fname}"
+    echo -e "${fle_encoded}" >>"${release_fname}"
+    echo -e "" >>"${release_fname}"
+  done
+
+
+  #It is better to add bigger files on the end of file, because of later we can easily remove it
+  #I dont want add docker fle and archive close each other in this file, it will be more difficult to remove big file ..
+  #error in this case
+  if [ "${ADD_BASE_IMAGE}" == "yes" ]; then
+    #buntu14045_yocto_base.v4.docker.tar.bz2
+    echo -e "\n  Searching docker archives *yocto_base.v*.*docker.tar.gz2"
+    for fle in "${_src_dir%/}"/*"_yocto_base.v"*".docker.tar.bz2"; do
+      [ ! -f "${fle}" ] && continue
+      #check if we have corresponding docker file, if not ...continue with searching ...
+
+      [ ! -f "${fle%.tar.bz2*}" ] && continue
+
+      dckr_file_dstpath="${_tmp_install_dir}/${fle##*/}"
+      echo -e "    File: ${fle##*/}"
+      fle_encoded=$(base64 ${fle})
+      echo -e "${dckr_file_dstpath}">>"${release_fname}"
+      echo "${fle_encoded}">>"${release_fname}"
+      echo -e "      >OK"
+      echo -e "" >>"${release_fname}"
+      unset fle_encoded
+      sleep 1
+    done
+  fi
+
+  return 0;
+}
+
+#Recreate files in base64 format from data in the end of yocto script.
+#Not all files in list have to be re-created in case of SKIP: in data then file is skiped
+recreate_file() {
+  local _filesinstorage=$1
+  local _recfile=$2
+  local _dest_directory=$3
+
+  if [ ! -z "${_dest_directory}" ]; then
+    if [ ! -e "${_dest_directory}" ]; then
+      if [ ! -f "${_dest_directory}" ]; then
+        mkdir -p "${_dest_directory}"
+      else
+        echo "  Error: Can not create the same folder name and file name in the same directory "
+        return 1
+      fi
+    fi
+    _dest_directory="${_dest_directory%/}"
+    _dest_directory="${_dest_directory}/"
+  fi
+  
+  data_src_file="${fname}"
+  
+  fle_index=0;
+  for fle in ${_filesinstorage[@]}; do
+    ((file_index+=1))
+    export file_index
+    if [ "${fle##*/}" == "${_recfile}" ]; then
+      base64_filedata=$(awk -v fle_index=$file_index 'BEGIN { data_part = 0 }{if(data_part == fle_index ){ print $0 }; if(($0 == "BASE64_DATA_FILES:")||(data_part>0 && $0 == "" )){ data_part+=1;} }' "${data_src_file}")
+      echo "${base64_filedata}" | base64 -d >"${_dest_directory}${fle##*/}"
+    fi
+  done
+  
+  return 0;
+  
+}
+
+#Recreate files in base64 format from data in the end of yocto script.
+#Not all files in list have to be re-created in case of SKIP: in data then file is skiped
+recreate_files() {
+  local _files=$1
+  declare -a _instfiles=( $_files )
+
+  echo -e "\nRe-create files :"
+  
+  if [ ! -e "${TEMP_INSTALLATION_DIRECTORY}" ]; then
+    if [ ! -f "${TEMP_INSTALLATION_DIRECTORY}" ]; then
+      mkdir -p "${TEMP_INSTALLATION_DIRECTORY}"
+    else
+      echo "  Error: Can not create the same folder name and file name in the same directory "
+      return 1
+    fi
+  fi
+
+  data_src_file="${fname}"
+  
+  fle_index=0;
+  for fle in ${_instfiles[@]}; do
+    echo -e "  ""$fle"
+    ((file_index+=1))
+    export file_index
+    
+    base64_filedata=$(awk -v fle_index=$file_index 'BEGIN { data_part = 0 }{if(data_part == fle_index ){ print $0 }; if(($0 == "BASE64_DATA_FILES:")||(data_part>0 && $0 == "" )){ data_part+=1;} }' "${data_src_file}")
+    if [ -z "${base64_filedata}" ]; then
+      echo -e "  Error: No data in $data_src_file file !"
+      return 1
+    fi
+    
+    if [ "${base64_filedata}" == "SKIP:" ]; then 
+      echo -e "    >Skip: No data in data array"
+      echo -e "      >Find file in local folder:"
+      fnameonly="${fle##*/}"
+      if [ -e "${fnameonly}" ]; then
+        echo -e "        >Found, copying to ${TEMP_INSTALLATION_DIRECTORY} directory. "
+        cp "${fnameonly}" "${TEMP_INSTALLATION_DIRECTORY}""/""${fle##*/}"
+      else
+        echo -e "      >Not Found"
+      fi
+      continue
+    fi
+    
+    echo "${base64_filedata}" | base64 -d >"${TEMP_INSTALLATION_DIRECTORY}""/""${fle##*/}"
+    
+  done
+  
+  return 0;
+}
+
+
+
+#Crazily slow in case of big files 10 min was not enough for cca 300MB base64 file
+#Recreate files in base64 format from data in the end of yocto script.
+#and return list(string with spaces) of all base64 files
+recreate_files2() {
+
+  local _data_src_file=$1
+  local _tmp_inst_dir=$2
+  local _ret="$3"
+
+  declare -a _arr_data_fles
+  declare -a _eval_datafles
+
+  echo -e "\nRe-create files :"
+  export _tmp_inst_dir
+
+
+  if [ ! -e "${_tmp_inst_dir}" ]; then
+    if [ ! -f "${_tmp_inst_dir}" ]; then
+      mkdir -p "${_tmp_inst_dir}"
+    else
+      echo "  Error: Can not create the same folder name and file name in the same directory "
+      return 1
+    fi
+  fi
+
+  #extraction of file names and paths
+  data_fles=$(awk 'BEGIN { data_part = 0; name_only=0 }{
+    ##names only
+    if(data_part&&name_only){
+      print $0
+      name_only=0
+    };
+    if(($0 == "BASE64_DATA_FILES:")||(data_part>0 && $0 == "" )){
+      data_part+=1;
+      name_only=1;
+    };
+  }' "${_data_src_file}")
+  _arr_data_fles=( ${data_fles} )
+
+  #file paths in data_fles varialbes have variables insides ...eval $user
+  for fle in ${_arr_data_fles[@]}; do
+    _eval_datafles+=($(eval echo "${fle}"))
+    _eval_datafles_ret="${_eval_datafles_ret}"" ""$(eval echo "${fle}")"
+  done
+
+  file_index=0;
+  for fle in ${_eval_datafles[@]}; do
+    echo -e "  ""$fle"
+    ((file_index+=1))
+    export file_index
+
+    #TODO:This is slow: Later>optimalization>decrease numbers of branches...
+    base64_filedata=$(awk -v fle_index=$file_index 'BEGIN { data_part = 0; name_only=0 }{
+      if(data_part == fle_index && name_only==0 && $0!=""){ print $0 };
+      if(data_part&&name_only){ name_only=0 };
+      if(($0 == "BASE64_DATA_FILES:")||(data_part>0 && $0 == "" )){data_part+=1;name_only=1}
+    }' "${_data_src_file}")
+    if [ -z "${base64_filedata}" ]; then
+      echo -e "  Error: No data in $data_src_file file !"
+      return 1
+    fi
+
+    echo "${base64_filedata}" | base64 -d >"${TEMP_INSTALLATION_DIRECTORY}""/""${fle##*/}"
+    unset base64_filedata
+    sleep 0.1
+
+  done
+
+  eval "${_ret}"='${_eval_datafles_ret}'
+
+  #this implemetation is crazily slow !!!!! imposible to use for big base64 files with size >1MB
+  #data_fles=$(awk -v tmp_inst_dir=$_tmp_inst_dir 'BEGIN { data_part = 0; name_only=0; cnti=0 }{
+  #  if(data_part && name_only==0 && $0!=""){
+  #    tmp=cnti-1
+  #    arr_data[tmp]=arr_data[tmp]$0
+  #  };
+  #  ##names only
+  #  if(data_part&&name_only){
+  #    ##print $0
+  #    fpaths[cnti]=$0
+  #    name_only=0
+  #    cnti+=1
+  #  };
+  #  if(($0 == "BASE64_DATA_FILES:")||(data_part>0 && $0 == "" )){
+  #    data_part+=1;
+  #    name_only=1;
+  #  };
+  #}END{
+  #  for(i=0;i<cnti;i++){
+  #    tmpcnt=split(fpaths[i],a,"/",sep); fname=a[tmpcnt]
+  #    cmd="echo "arr_data[i]" |base64 -d >"tmp_inst_dir"/"fname
+  #    errval=system(cmd)
+  #    if(errval!=0){
+  #      print "\nError:{ "fname", errval="errval"}"
+  #      exit 1
+  #    }else{
+  #      print fpaths[i]
+  #    }
+  #  }
+  #}' "${_data_src_file}")
+
+  #_errval=$?
+  #if [ "${_errval}" != "0" ]; then
+  #  echo "Error: recreate_files(): "
+  #  echo $(echo "${data_fles}" | grep "Error")
+  #  return 2
+  #else
+  #   eval "${_ret}"='${data_fles}'
+  #fi
+
+  return 0;
+}
+
+
+cp_docker_archives_to_usr_dir(){
+  local _data_files=$1
+  declare -a _arr_data_files=( ${_data_files} )
+  local _tmp_inst_dir=$2
+
+  echo -e "\nSearching archives of base images(*yocto_base.v*.docker.tar.bz2) file :"
+
+  #searching in list of base64 data files,
+  # if in list only yocto_base*.docker > search in local fldr related archive files and cpy them to tmp_inst_dir
+  #  > rewrite the one in users"s folder by one in local folder
+
+  for fle in ${_arr_data_files[@]}; do
+    fnameonly="${fle##*/}"
+
+    _dckrfle=$(echo ${fnameonly} | egrep yocto_base\..*v\..*docker)
+
+    if [ ! -z "${_dckrfle}" ]; then
+      echo "  ""${fnameonly}.tar.bz2"
+    else
+      continue
+    fi
+
+    echo -e "    >Find file in local folder:"
+    if [ -e "${fnameonly}.tar.bz2" ]; then
+      echo -e "      >Found, copying to ${_tmp_inst_dir} directory. "
+      cp -f "${fnameonly}.tar.bz2" "${_tmp_inst_dir}""/"
+    else
+      echo -e "      >Not Found"
+    fi
+
+  done
+
+}
+
+
+
+cygwin_vboxinstall() {
+  local _mainlink="http://download.virtualbox.org/virtualbox/"
+  local _ver=$(curl "${_mainlink}LATEST.TXT" )
+  local _lstver_dir="${_mainlink}${_ver}"
+  local _pkglst=$(curl "${_lstver_dir}" | grep exe)
+  local _tmp="${_pkglst%%exe*}exe"
+  local _pkgname=${_tmp##*=}
+  local _pkgname=${_pkgname/\"/}
+  local _dlink="${_mainlink}${_ver}/${_pkgname}"
+  
+  echo -e "\nDownloading VirtualBox:\n"
+  curl -O "${_dlink}"
+  echo -e "\n"
+  sleep 1
+  chmod +x ./${_pkgname}
+  
+  echo -e "\nInstalling VirtualBox:\n"
+  ./${_pkgname}
+  
+}
+
+cygwin_install_chocolatey() {
+
+  #ischocolatey installed ?
+  bla=$(choco)
+  ret=$?
+  #if choco is started with no params return 1
+  [ ${ret} == "1" ] && return 0;
+
+  echo -e "          This console have to be in privileged mode "
+  echo -e "          Press Enter to continue"
+  read -p "          >"
+      
+  echo -e "\n\nChocolatey Installation: \n"
+  echo -e "  Change Execution Rules to RemoteSigned : \n"
+  echo -e "\n" | powershell -NoProfile -Command "Set-ExecutionPolicy -ExecutionPolicy RemoteSigned"
+      
+  echo -e "  Docker Installation from Chocolatey repo: \n"
+  echo -e "\n" | powershell -NoProfile -ExecutionPolicy Bypass -Command "iex ((New-Object System.Net.WebClient).DownloadString('https://chocolatey.org/install.ps1'))"
+
+}
+
+cygwin_install_docker() {
+
+  #isdocker installed ?
+  bla=$(docker -v)
+  ret=$?
+  #if docker is started with -v param return 0
+  [ ${ret} == "0" ] && return 0;
+  
+  echo -e "\n\nDocker client from Chocolatey repo: \n"
+  cmd /c "choco install docker"
+  echo -e "\n\n"
+  
+}
+
+cygwin_install_docker_machine() {
+
+  #isdocker installed ?
+  bla=$(docker-machine -v)
+  ret=$?
+  #if docker is started with -v param return 0
+  [ ${ret} == "0" ] && return 0;
+
+  echo -e "\n\nDocker machine from Chocolatey repo: \n"
+  cmd /c "choco install docker-machine"
+  echo -e "\n\n"
+  
+}
+
+#to run this we have to have sudo rights for manipulation with /etc/sudoers
+set_sudoers() {
+
+  sudoerr_file="/etc/sudoers"
+  sudoerr_incldir="/etc/sudoers.d"
+  sudoerr_inclusrfile="${sudoerr_incldir}/yocto-tools_${USER_NAME_HOST}"
+
+  if [ ! -f "${sudoerr_file}" ]; then
+    echo -e "ERROR: Unable to find sudoers file. Exiting"
+    exit
+  fi
+
+  #check if general /etc/sudoers includes sycimg symount commands if not > add
+  subsystfiles_in_sudoers=$(sudo bash -c "cat "${sudoerr_file}" | egrep yocto-tools.*sycimg.*symount")
+  if [ -z "${subsystfiles_in_sudoers}" ]; then
+     sudo bash -c "echo -e \%yocto-tools   ALL\=NOPASSWD:  /usr/local/bin/sycimg, /usr/local/bin/symount >>"${sudoerr_file}" "
+  fi
+
+
+
+  if [ "${INSTALL_SERVICES}" != "yes" ]; then
+    return 0;
+  fi
+
+  #check if #includedir /etc/sudoers.d exist if not add and create directory
+  includedir_in_sudoers=$(sudo bash -c "cat "${sudoerr_file}" | egrep '\#includedir'.*'/etc/sudoers.d'")
+  if [ -z "${includedir_in_sudoers}" ]; then
+     sudo install -m 755 -d /etc/sudoers.d
+     sudo bash -c "echo -e \#includedir /etc/sudoers.d >>"${sudoerr_file}" "
+  fi
+
+  #add services related commands
+  if [ -f "${sudoerr_inclusrfile}" ]; then
+    echo -e "\nWarning: Sudoerrs file for given user already exist and will be erased"
+    sudo rm "${sudoerr_inclusrfile}"
+  fi
+
+  sudo bash -c "echo -e  "${USER_NAME_HOST}"  ALL\=NOPASSWD:  /bin/systemctl start docker_user@"${USER_NAME_HOST}".service >>${sudoerr_inclusrfile}"
+  sudo bash -c "echo -e  "${USER_NAME_HOST}"  ALL\=NOPASSWD:  /bin/systemctl stop  docker_user@"${USER_NAME_HOST}".service >>${sudoerr_inclusrfile}"
+  sudo bash -c "echo -e  "${USER_NAME_HOST}"  ALL\=NOPASSWD:  /bin/systemctl stop  mounts_disconects@"${USER_NAME_HOST}".timer >>${sudoerr_inclusrfile}"
+  sudo bash -c "echo -e  "${USER_NAME_HOST}"  ALL\=NOPASSWD:  /bin/systemctl start mounts_disconects@"${USER_NAME_HOST}".timer >>${sudoerr_inclusrfile}"
+
+}
+
+install_files() {
+  local _files=$1
+  declare -a _instfiles
+  declare -a _ssfiles=( $2 )
+  local _tmp_install_dir=$3
+
+  local _tmp_buildmachine_new_template="no"
+
+  local _tmp_skip="false"
+  
+  if [ "${OS_STRING}" != "NATIVE_LINUX" ]; then
+    
+    echo -e "Windows system preparation: "
+    
+    #VirtualBox(try install )->
+    #exit script in case of error, if Vbox is found >return
+    cygwin_get_vboxclitool
+    ret=$?
+    if [ "${ret}" != "0" ]; then
+      cygwin_vboxinstall
+      cygwin_get_vboxclitool
+      ret=$?
+      [ "${ret}" != "0" ] && exit 1
+    fi
+    
+    if [ "${IS64BIT}" == "n" ]; then
+      #In case of 32 bit win, we need to install docker from chocolatey
+      #Chocolatey(install)->choco docker install
+      #Docker machine
+      echo -e " Windows: Docker engine is not distributed in default docker repo in 32 bit version !"
+      echo -e "          Because of that we need to install docker from Cocolatey repo"
+    else
+      echo -e " Windows: Docker engine and docker-machine will be installed by Chocolatey repo !"
+    fi
+    
+    cygwin_install_chocolatey
+      
+    cygwin_install_docker
+      
+    cygwin_install_docker_machine
+
+  fi
+  
+  #recreate_files "${_files}"
+
+  recreate_files2 "${fname}" "${_tmp_install_dir}" base64fles
+
+  retval=$?
+  if [ "$retval" == "0" ]; then
+    _instfiles=( "${base64fles}" )
+    #echo -e "This files: \n${bla[@]}"
+  else
+    return 1
+  fi
+
+  cp_docker_archives_to_usr_dir "${base64fles}" "${_tmp_install_dir}"
+
+  #skip copy file in case of  ./yocto install --install-services command, only services should be installed not rewrited ...
+  #{ Copy Files
+  echo -e "\nCopying Files:"
+
+  #3)in case of standalone Windows PC installation:
+  if [ "${OS_STRING}" != "NATIVE_LINUX" ]; then
+    cp -f "${fname}" "${_tmp_install_dir}/${fname}"
+    _instfiles=( "/usr/local/bin/${fname}" ${_instfiles[@]} )
+  fi
+
+  if [ "${INSTALL_SUBSYSTEM_FILES}" == "yes" ]; then
+    #Add this script to installation files:
+    cp -f "${fname}" "${_tmp_install_dir}/${fname}"
+    _instfiles=( "/usr/local/bin/${fname}" ${_instfiles[@]} )
+  fi
+
+  
+  for fle in ${_instfiles[@]}; do
+
+    #if dest dir is same as extraction dir, we already have that files..
+    if [ "${_tmp_install_dir}" == "${fle%/*}" ]; then
+      continue
+    fi
+
+    #TODO: 2018.01.04 Skip template file(docker_user_default) copying in case :
+    #     "${INSTALL_SERVICES}" == "yes" && "${INSTALL_SUBSYSTEM_FILES}" == "no"
+    #additional things are needed:later
+    #4 installation types:
+    #1.A)Buildmachine type(admin install)        : copy/install all files and services
+    #    > ok, tested
+    #1.B)Buildmachine type(user add install)     : only copy services related files with exception of template file
+    #                                            : >copy all docker files
+    #    >ok, tested
+
+    #2)Standalone Linux PC type   : copy/install only subsystem files
+    #    >ok, tested
+
+    #3)Standalone Windows PC type : only install yocto file and nothing more
+    # >ok, no test
+
+    #Services copying
+    #the "${fle##*/}" == *"docker_user"* line also skip template file for docker_user service in case that docker_user services are not necessary....
+    if [ "${INSTALL_SERVICES}" == "no" ]; then
+      if [[ "${fle##*/}" == *"docker_user"* ]] \
+      || [ ${fle##*.} == "service" ] || [ ${fle##*.} == "socket" ] || [ ${fle##*.} == "timer" ]; then
+          continue
+      fi
+    fi
+
+    #1.B)in case of Builmachine installation and user add only: skip template file and use current one installed by admin ..
+    if [ "${INSTALL_SERVICES}" == "yes" ] && [ "${INSTALL_SUBSYSTEM_FILES}" == "no" ]; then
+      if [ "${fle##*/}" == "${DOCKER_USER_BUILMACHINE_TEMPLATE_CONFIG_FNAME}" ]; then
+          continue
+      fi
+    fi
+
+
+
+    #yocto subsystem internal tools copying [ ymount ycimg ]
+    local _tmp_skip="false"
+    if [ "${INSTALL_SUBSYSTEM_FILES}" == "no" ]; then
+      for ssfle in "${_ssfiles[@]}"; do 
+        if [ "${fle##*/}" == "${ssfle}" ]; then
+          _tmp_skip="true";break
+        fi
+      done
+      [ "${_tmp_skip}" == "true" ] && continue
+    fi
+    
+    echo -e "  ""$fle"
+
+    #check if file exist in given destination
+    if [ -f "$fle"  ]; then 
+      echo -e "  Info: "'"'$fle'"'" file already exists !!\n        Do you wanna re-write this file ?[y/n]"
+      read -p "        >" yn
+      if [ "$yn" = "y" ]||[ "$yn" = "yes" ]; then
+        ${sudo} cp -f "${_tmp_install_dir}""/""${fle##*/}" "${fle}"
+        ${sudo} chown "${USER_NAME_HOST}" "${fle}"
+        ${sudo} chmod +xr "${fle}"
+
+        if [ "${fle##*/}" == "${DOCKER_USER_BUILMACHINE_TEMPLATE_CONFIG_FNAME}" ]; then
+        #replacing settings(template) for buildmachine
+          _tmp_buildmachine_new_template="yes"
+        fi
+
+      fi
+    else
+        local _inst_dir="${fle%/*}"
+        if [ ! -e "${_inst_dir}" ]; then
+          ${sudo} mkdir -p "${_inst_dir}";
+          ${sudo} chown "${USER_NAME_HOST}" "${_inst_dir}"
+        fi
+        ${sudo} cp -f "${_tmp_install_dir}""/""${fle##*/}" "${fle}"
+        ${sudo} chown "${USER_NAME_HOST}" "${fle}"
+        ${sudo} chmod +xr "${fle}"
+
+        #
+        if [ "${fle##*/}" == "${DOCKER_USER_BUILMACHINE_TEMPLATE_CONFIG_FNAME}" ]; then
+        #first time installation in buildmachine > creating *qemurawimg for docker overlay system
+          _tmp_buildmachine_new_template="yes"
+        fi
+    fi
+  done
+  #}
+  
+  if [ "${OS_STRING}" != "NATIVE_LINUX" ]; then
+    echo -e " \n\n !! PLEASE CLOSE/TERMINATE TERMINAL AND CONTINUE IN NEW ONE !! \n\n"
+  else
+    #only in case of linux set sudoers
+    set_sudoers
+  fi
+
+
+  #{ Install Services
+  if [ "${INSTALL_SERVICES}" == "no" ]; then
+    return 0
+  fi
+  
+  echo -e "\nInstall Services:"
+  sudo systemctl daemon-reload
+  for fle in ${_instfiles[@]}; do
+    
+    #{ Systemd Services :
+    #Support for installation of normal systemd service or session-service
+    if [ ${fle##*.} == "service" ] || [ ${fle##*.} == "socket" ] || [ ${fle##*.} == "timer" ]; then 
+    
+      echo -e "  ""$fle"
+        
+      systemd_service=${fle##*/}
+      if [[ "${systemd_service}" == *"@."* ]]; then
+        #session service> session id is USER_NAME
+        session_service_full_name=${systemd_service/@./@${USER_NAME_HOST}.}
+        sudo systemctl enable "${session_service_full_name}"
+        
+        if [ ${fle##*.} == "timer" ]; then
+          sudo systemctl start "${session_service_full_name}"
+        fi
+        
+      else
+        sudo systemctl enable "${systemd_service}"
+      fi
+    fi
+    #}
+  done
+  sudo systemctl daemon-reload
+
+  if [ "${INSTALL_SERVICES}" == "yes" ]; then
+  #HERE, USER HAVE TO HAVE FULL SUDO RIGHTS, if not, it is impossible to prepare storage for docker images(chmod create dir..etc)
+
+    # _tmp_buildmachine_new_template=yes
+    # >>ask for path for docker storage, rewrite template,  create docker storage for given
+    # _tmp_buildmachine_new_template=no
+    # >>take a look to template,create path and create docker storage for given user
+
+    #check if HOME/.config/docker_user/docker exist and delete it.
+    #Now we know that we have replaced /etc/default/docker_user_default,
+    #which is template settings for all users on buildmachine.
+    #Therefore, we want to install fresh settings.
+    if [ -e "${DOCKER_USER_CONFIG_DIR}" ]; then
+      rm "${DOCKER_USER_CONFIG_DIR}"/docker 2>/dev/null
+    fi
+
+    echo -e "\nUn-mounting all images:\n"
+    /usr/local/bin/ymount unmount --unmount-all
+    echo -e "\n"
+
+    echo -e "\nBuildMachine Setup (Multi-user environment):\n"
+
+    if [ "${_tmp_buildmachine_new_template}" = "yes" ]; then
+      echo -e "  Every user in system have separated overlay storage space for docker deamon."
+      echo -e "  This storage settings is stored in template file ${DOCKER_USER_BUILMACHINE_TEMPLATE_CONFIG} "
+      echo -e "  in variable EXT_MOUNT_DOCKER_STORAGE."
+      echo -e "  For example: EXT_MOUNT_DOCKER_STORAGE=/mnt/nas/build-aufs-docker/USER_NAME/docker_imgs_storage.qemurawimg"
+      echo -e "  This settings will be copied to user's file HOME/.config/docker_user/docker  "
+      echo -e "  only once during first start of docker_user@USER.service "
+      echo -e "  Therefore, administrator will set path only once in ${DOCKER_USER_BUILMACHINE_TEMPLATE_CONFIG} ."
+      echo -e "  For example: ALL_USERS_STORAGE/USER_NAME/docker_imgs_storage.qemurawimg "
+      echo -e "               /mnt/nas/build-aufs-docker/pepa/docker_imgs_storage.qemurawimg "
+      echo -e "               /mnt/nas/build-aufs-docker/jelito/docker_imgs_storage.qemurawimg "
+      echo -e "\n"
+      echo -e "  Please enter path where all users will store docker s overlay file system(ALL_USERS_STORAGE) "
+      echo -e "  Example: /mnt/nas/build-aufs-docker/"
+      read -p "        >" -e _prefix_path
+
+      #write storage settings on the end of settings file, last var rewrite previous ....
+      echo -e "\n">>"${DOCKER_USER_BUILMACHINE_TEMPLATE_CONFIG}"
+      echo 'EXT_MOUNT_DOCKER_STORAGE=''"'${_prefix_path%/*}'/$_USER/docker_imgs_storage.qemurawimg''"'>>"${DOCKER_USER_BUILMACHINE_TEMPLATE_CONFIG}"
+      echo -e "\n"
+
+      _allpthtmp="${_prefix_path%/}""/$USER_NAME_HOST/docker_imgs_storage.qemurawimg"
+
+    else
+      _allpthtmp=$(_USER="${USER_NAME_HOST}"; . "${DOCKER_USER_BUILMACHINE_TEMPLATE_CONFIG}"; echo $EXT_MOUNT_DOCKER_STORAGE)
+    fi
+
+    echo -e "Docker storage for container images:"
+    echo -e "        >${_allpthtmp}"
+
+    #make directory if does not exist
+    if [ ! -d "${_allpthtmp%/*}" ]; then
+      mkdir -p "${_allpthtmp%/*}"
+    fi
+
+    #write access test
+    _bla="${_allpthtmp%/*}/${RANDOM}"
+    echo "writetest">"${_bla}"
+    _err_ret=$?
+    if [ "${_err_ret}" != "0" ]; then
+        echo -e "\n\nError: Unable to write to directory.Exiting "
+        exit 1
+    fi
+
+    echo -e "\nCreating storage for container images:\n"
+    echo -e "\n  Press Enter to continue"
+    read -p   "  >"
+
+    #storage already exist > skip
+    if [ -f "${_allpthtmp}" ]; then
+      echo -e "  Warning: Storage for container images already exist. "
+      echo -e "  >Skiping"
+      echo -e "\n  Press Enter to continue"
+      read -p   "  >"
+    else
+      #TODO: Problem with rights? Here full sudo user want to make image and access to img will be made from docke_user service which is running as root.
+      #No problem with access to img in above mentioned case, but in general we allow any user to create file in --img-path folder sycimg running as root>wrong
+      #/usr/local/bin/ycimg --user="$USER_NAME_HOST" --img-size-gb="${DOCKER_USER_DOCKER_IMAGES_STORAGE_SIZE_GB}" --img-path="${_allpthtmp%.*}"
+
+      /usr/local/bin/ycimg --img-size-gb="${DOCKER_USER_DOCKER_IMAGES_STORAGE_SIZE_GB}" --img-path="${_allpthtmp%.*}"
+
+      sync
+      sleep 3
+      if [ ! -f "${_allpthtmp}" ]; then
+        echo -e "\n\nError: Unable to create storage. Exiting"
+        exit 1
+      else
+        echo -e "\n\n>Ok"
+      fi
+    fi
+
+    echo -e "\nMounting storage for container images:\n"
+    echo -e "\n  Press Enter to continue"
+    read -p   "  >"
+
+    /usr/local/bin/ymount -i=0 -n -m="$_allpthtmp"
+    _ret=$?
+    [ "${_ret}" != "0" ] && exit 1
+
+    sync
+    sleep 2
+    sudo mkdir -p "/mnt/$USER_NAME_HOST/vd0/docker"
+    sync
+    sleep 2
+    if [ ! -d "/mnt/$USER_NAME_HOST/vd0/docker" ]; then
+      echo "Error: Unable to create directory in docker_imgs_storage.qemurawimg. Exiting"
+      exit 1
+    fi
+    sleep 2
+    /usr/local/bin/ymount -i=0 unmount
+    sync
+
+    echo -e "\n-----------------------------------------------"
+    echo -e "\nStarting docker_user service :\n"
+    sudo systemctl start docker_user@${USER_NAME_HOST}.service
+    _ret=$?
+    if [ "${_ret}" == "0" ]; then
+      echo -e "\n  > Ok"
+      echo -e   "  > "'Please run "yocto" command in new terminal'
+      echo -e "-----------------------------------------------\n"
+    else
+      echo -e "\n  > Error"
+      echo -e "-----------------------------------------------\n"
+      return 1;
+    fi
+
+  fi
+
+
+  #}
+  return 0;
+}
+
+
+#Create tar.bz2 image from $_yocto_base_docker_file within _yocto_base_dir
+#created tar.bz2 archive is also within _yocto_base_dir
+create_docker_image_archive_yocto_base(){
+  local _yocto_base_docker_file=$1
+  local _yocto_base_image_file=$2
+  local _yocto_base_image_name=$3
+  local _yocto_base_dir=$4
+
+  local _ret=0
+  
+  if [ ! -z "${_yocto_base_dir}" ]; then 
+    _yocto_base_dir="${_yocto_base_dir%/}/"
+  fi
+  
+  if [ ! -e "${_yocto_base_docker_file}" ]; then 
+   echo "Error:  DockerFile "'"'${_yocto_base_docker_file}'"'" does not exist "
+   return 1
+  fi
+  
+  docker_identify docker_cmd
+  _ret=$?
+  [ "${_ret}" != 0 ] && return "${_ret}"
+  
+  
+  echo -e "Create Yocto Base Image: \n"
+  
+  if [ -z "${_yocto_base_dir}" ]; then 
+    _yocto_base_dir="."
+  fi
+
+  #TODO:
+  # In case that links are used as docker files, following error appears:
+  #unable to prepare context: the Dockerfile (/home/alcz11702218/projects/yocto-tools/full/src/ubuntu1604_yocto_base.v1.docker) must be within the build context
+  #Error: Build of "/home/alcz11702218/projects/yocto-tools/full/src/ubuntu1604_yocto_base.v1.docker" dockerfile failed.
+  #TODO: Detect if $_yocto_base_docker_file" is link and inform user or quit ???
+
+  DOCKER_YOCTO_BASE_BUILD_PARAMS=" -f ${_yocto_base_docker_file} \
+                                   -t ${_yocto_base_image_name} \
+                                      ${_yocto_base_dir} "
+
+  if [ "${OS_STRING}" != "NATIVE_LINUX" ]; then
+    DOCKER_YOCTO_BASE_BUILD_PARAMS=" -f $(cygpath -aw ${_yocto_base_docker_file}) \
+                                     -t ${_yocto_base_image_name} \
+                                      $(cygpath -aw ${_yocto_base_dir}) "
+  fi
+  
+  docker_yocto_img=$("$docker_cmd" images | egrep "${_yocto_base_image_name%:*}".*"${_yocto_base_image_name#*:}")
+
+  if [ ! -z "$docker_yocto_img" ]; then
+    echo -e "  Warning: Docker image ${_yocto_base_image_name} already exists, do you want to delete this image?[y/n]"
+    read -p "         >" yn
+
+    if [ "$yn" == "y" ]; then
+      echo -e " Delete image:"
+      "$docker_cmd" rmi "${_yocto_base_image_name}"
+    fi
+  fi
+
+  echo -e "  Docker build: \n"
+  "${docker_cmd}" build ${DOCKER_YOCTO_BASE_BUILD_PARAMS}
+  _ret=$?
+  if [ "${_ret}" != 0 ]; then
+    echo "    Error: Build of "'"'${_yocto_base_docker_file}'"'" dockerfile failed."
+    return "${_ret}"
+  fi
+
+  yn="y"
+  if [ -e "${_yocto_base_image_file}" ]; then
+    echo -e "  Warning: Tar.bz2 archive ${_yocto_base_image_file} already exists, do you want to rewrite this archive?[y/n]"
+    read -p "         >" yn
+  fi
+  if [ "$yn" == "y" ]; then 
+  
+    echo -e "  Docker save: \nThis task will take some time, depends on image size:\n"
+    #_yocto_base_image_file={docker_file}.tar.bz2
+    "${docker_cmd}" save ${_yocto_base_image_name} -o "${_yocto_base_image_file%.bz2*}"
+    _ret=$?
+    if [ "${_ret}" != 0 ]; then 
+      echo -e "\n\n    Error: Docker save of "'"'${_yocto_base_image_name}'"'" image failed."
+      return "${_ret}"
+    fi
+    echo -e "\n\n"
+    
+    echo -e "  Docker image compression: \nThis task will take some time, depends on image size:\n"
+    #remove original *name.tar archive automatically
+    bzip2 -f -9 -vv "${_yocto_base_image_file/%.bz2*}"
+    _ret=$?
+    if [ "${_ret}" != 0 ]; then 
+      echo -e "\n\n    Error: Docker image compression of "'"'${_yocto_base_image_name/.bz2/}'"'" image failed."
+      return "${_ret}"
+    fi
+  fi
+
+} 
+
+
+help_desc() {
+echo -e "\
+  Usage:  yocto COMMAND OPTIONS
+                
+  COMMAND: install
+  |--OPTIONS: --install-subsystem-files, --install-services
+  |
+  |  >Only in case of install command we have to run "yocto" command in directory of executable
+  |  >Copy and set up tools/evironment in directories:
+  |   /usr/local/bin/*,
+  |   /home/USER/.config/yocto_docker/*
+  |
+  |
+  | ->In case of single-user PC(linux) please just run:
+  |    $ yocto install --install-subsystem-files
+  |
+  | ->In case of windows OS:
+  |   Yocto tool will install VirtualBox and chocolatey instalation tool.
+  |   At first install cygwin(+curl) and run terminal in priviledged mode:
+  |   $ yocto install
+  |
+  | ->In case of multi-user environment(buildmachine, linux), first time installation run:
+  |    $ yocto install --install-subsystem-files --install-services
+  |
+  | ->In case of multi-user environment(buildmachine, linux), add new user:
+  |   $ yocto install --install-services
+
+  COMMAND: cimg
+  | ->Run ycimg tool and create image for storing yocto environment
+  |   Unavailable in Windows
+
+  COMMAND: { run | '""' }
+  |--OPTIONS: --custom-docker-file| --custom-docker-file="DOCKER_FILE" | -c="DOCKER_FILE" |-c, --restart
+  |
+  | ->Run docker_user/docker with yocto-docker-container and bind
+  |   yocto image storage(docker -v) in host to container directory
+  |   (docker -v /mnt/USER/vd0/opt:/opt) run XXX
+  |
+  | ->OPTION: --custom-docker-file| --custom-docker-file="DOCKER_FILE" | -c="DOCKER_FILE" |-c
+  |   Try to run docker from docker file.
+  |   In case that option value is empty, list all docker files in DOCKER_BUILD_DIRECTORY and let user select one of them.
+  |
+  | ->OPTION: --restart
+  |   Restart virtual machine
+  |   Available only in Windows.
+
+  COMMAND: update
+  |  Check current and aviable versions and install tools.
+  |  Not implemented.
+  
+  COMMAND: { cdbimg | cdbimg="DOCKER_FILE" }
+  |  >Create docker base image. Yocto tool is composed from two docker images in order to speed up entirely process.
+  |   First docker image(docker_base_image) includes only basic environment including yocto dependencies.
+  |   This step takes a lot of time(package downloads, distro update),
+  |   because of this it can be distributed as tar.bz2 archive and during { "install" }
+  |   will be stored in user's folder /home/USER/.config/yocto_docker/*.
+  |   During yocto run and any docker_base_image in docker, yocto tool search docker_yocto_base image
+  |   in form of tar.bz2 archive in user's directory
+  |   /home/USER/.config/yocto_docker/*. As last step, in case of missing *.tar.bz2
+  |   tool makes image from distributed docker file in /home/USER/.config/yocto_docker/*.
+  |
+  |  In short, this step just create docker_base_image
+  |  located in DOCKER_FILE_DIR__AND__IMG_FILE_DIR directory or in current directory.
+  |
+  |  Name of docker file is give by YOCTO_BASE_DOCKER_FILE variable.
+
+  COMMAND: { release | release="DIRECTORY_OF_UPDATED_FILES" }
+  |--OPTIONS: {--add-base-image}
+
+"
+}
+
+
+
+cygwin_get_vboxclitool() {
+  local _ret=$1
+  
+  echo -e "Searching VirtualBox tools:"
+  
+  #cygwin in win> we will mount our yocto drive directly to docker-machine with vbox cli tool VBoxManage
+  OIFS=$IFS
+  IFS=","
+  VBOXMANAGE=( $(find /cygdrive/c/"Program Files" 2>/dev/null | grep -i VBoxManage.exe | awk '{str=$0","; print str}' ) )
+  if [ "${#VBOXMANAGE[@]}" -eq "0" ]; then
+      echo -e "\n  Error: Not able to find VBoxManage.exe in Program Files directory, please reinstall VirtualBox."
+      IFS="${OIFS}"
+      return 1
+  elif [ "${#VBOXMANAGE[@]}" -eq "1" ]; then
+      echo -e "\n  info: VBoxManage.exe found"
+      VBOXMANAGE="${VBOXMANAGE[0]}"
+      IFS="${OIFS}"
+  elif [ "${#VBOXMANAGE[@]}" -gt "1" ]; then
+      echo -e "\n  Error: Multiple VBoxManage.exe in Program Files directory, please rename/delete old ones and run it again"
+      IFS="${OIFS}"
+      return 2
+  fi
+  
+  return 0
+  #eval "${_ret}"="${VBOXMANAGE}"
+  
+}
+
+
+cygwin_vbox_create_docker_machine() {
+
+  echo -e "\nPreparing docker-machine:\n"
+  
+  #check docker machine 
+  dmachine_status=$(docker-machine status "${VBOX_DOCKER_MACHINE_NAME}" ) 
+  ret=$?
+  if [[ "${dmachine_status}" == *"Error"* ]] || [[ "${dmachine_status}" == *"error"* ]]; then
+    #in case that machine exist and VBOX virtual did not! >remove and create again ?
+    echo -e "\n\n  Error: docker-machine status error "
+    echo -e "\n         Do you want to remove docker-machine ${VBOX_DOCKER_MACHINE_NAME} ? [y/n]"
+    yn="n"
+    read -p "        >" yn
+    if [ "$yn" == "y" ]; then
+      docker-machine rm "${VBOX_DOCKER_MACHINE_NAME}"
+      sleep 1
+    else
+      exit 1
+    fi
+  fi
+
+  #machine exist ?
+  dmachine_status=$(docker-machine status "${VBOX_DOCKER_MACHINE_NAME}" ) 
+  ret=$?
+  if [ "${ret}" != "0" ]; then
+    # zero is returned only in case that machine does not exist, in case of error 0 was always returned
+    #This step take a time due to download of boot2docker.iso,
+    #so sdtout from this command should be visible to user.
+    echo -e "\n\nCreating docker-machine ${VBOX_DOCKER_MACHINE_NAME}:\n"
+    docker-machine create -d virtualbox "${VBOX_DOCKER_MACHINE_NAME}"
+    ret=$?
+    if [ "${ret}" != "0" ]; then
+      echo -e "\n  Error: Unable to create docker-machine"
+      exit 1
+    fi
+    
+  fi
+  
+  if [ "${RESTART_DOCKER_MACHINE}" == "yes" ]; then 
+    #if running->stop->start
+    #if stopped->start
+    
+    echo -e "\n\n  Restarting ${VBOX_DOCKER_MACHINE_NAME} docker-machine: \n\n"
+    
+    isstopped=$(echo ${dmachine_status} | grep -i stopped )
+    if [ -z "${isstopped}" ]; then
+      #if running->stop->start
+      
+      
+      echo -e "\n\n  Docker machine is running: Stop\n\n"
+      #stop
+      docker-machine stop "${VBOX_DOCKER_MACHINE_NAME}"
+      ret=$?
+      if [ "${ret}" != "0" ]; then
+        echo -e "\n    Error: Unable to stop docker-machine"
+        exit 1
+      fi
+      
+    fi
+    #if stopped->start
+    
+    echo -e "\n\n  Docker machine is stopped: Start\n\n"
+    #start
+    docker-machine start "${VBOX_DOCKER_MACHINE_NAME}"
+    ret=$?
+    if [ "${ret}" != "0" ]; then
+      echo -e "\n    Error: Unable to start docker-machine"
+      exit 1
+    fi
+    
+  
+  fi
+  #in order to add new drive to setting vbox have to be stopped
+  #isstopped=$(echo ${dmachine_status} | grep -i stopped )
+
+  #if [ -z "${isstopped}" ]; then
+  #  bla=$(docker-machine stop "${VBOX_DOCKER_MACHINE_NAME}")
+  #  ret=$?
+  #  if [ "${ret}" != "0" ]; then
+  #    echo -e "\n  Error: Unable to stop docker-machine"
+  #    exit 1
+  #  fi
+  #fi
+
+}
+
+
+os_detect() {
+
+  local _ret=$1
+  local _ret2=$2
+
+  local _IS64BIT="n"
+  
+  iscygwin=$(uname | grep -i cygwin)  
+  
+  [[ "$(uname -m)" == *"64"* ]] && _IS64BIT="y"
+  
+  if [ ! -z ${iscygwin} ]; then
+    eval "${_ret}"="CYGWIN"
+  else
+    eval "${_ret}"="NATIVE_LINUX"
+    
+    testedenv=$(lsb_release -i | egrep -i "ubuntu|fedora") 
+    if [ -z "${testedenv}" ]; then
+      echo -e "\n\n--\n  Warning: This distribution have not been tested !\n--\n\n"
+    fi
+  fi
+  
+  eval "${_ret2}"="${_IS64BIT}"
+  
+}
+
+
+main() {
+
+  echo -e "\n"
+  os_detect OS_STRING IS64BIT
+  
+  sudo=""
+  if [ "${OS_STRING}" == "NATIVE_LINUX" ]; then
+    sudo="sudo"
+    export sudo
+  fi
+  
+  
+  VERSION="0.1"
+  
+  fname=$(basename $0)
+  release_fname="../release/${fname}"
+  
+  operation="run"
+  
+  ADD_BASE_IMAGE="no"
+  INSTALL_SUBSYSTEM_FILES="no"
+  INSTALL_SERVICES="no"
+  RESTART_DOCKER_MACHINE="no"
+
+  DOCKER_USER_DOCKER_IMAGES_STORAGE_SIZE_GB="10"
+
+  #Because of -n parameter ymount will not do secont mount to /opt/$USER/works,
+  #because of that also did not check if we have empty, fresh image from ycimg
+  #But, it allow as test image owner and opt paths
+  YOCTO_IMAGE_MOUNT_COMMAND_NO_OPT="ymount -i=0 -n"
+  YOCTO_IMAGE_MOUNT_COMMAND="ymount -i=0"
+  
+  #{
+  USER_NAME_HOST=$(id -un $USER)
+  USER_UID_HOST=$(id -u $USER)
+  USER_GID_HOST=$(id -g $USER)
+
+  YOCTO_DOCKER_CONFIG_DIR="/home/$USER_NAME_HOST/.config/yocto_docker"
+  DOCKER_USER_CONFIG_DIR="/home/$USER_NAME_HOST/.config/docker_user"
+
+  TEMP_INSTALLATION_DIRECTORY="${YOCTO_DOCKER_CONFIG_DIR}/tmp_yocto_inst_${VERSION}"
+  DOCKER_BUILD_DIRECTORY="${YOCTO_DOCKER_CONFIG_DIR}/build_${VERSION}"
+
+#{paths in base64 files, used during update command
+  BASE64_DATA_YOCTO_DOCKER_CONFIG_DIR="/home/\$USER_NAME_HOST/.config/yocto_docker"
+  BASE64_DATA_DOCKER_USER_CONFIG_DIR="/home/\$USER_NAME_HOST/.config/docker_user"
+
+  BASE64_DATA_TEMP_INSTALLATION_DIRECTORY="${BASE64_DATA_YOCTO_DOCKER_CONFIG_DIR}/tmp_yocto_inst_${VERSION}"
+  BASE64_DATA_DOCKER_BUILD_DIRECTORY="${BASE64_DATA_YOCTO_DOCKER_CONFIG_DIR}/build_${VERSION}"
+#}
+
+  DOCKER_USER_BUILMACHINE_TEMPLATE_CONFIG_FNAME="docker_user_default"
+  DOCKER_USER_BUILMACHINE_TEMPLATE_CONFIG="/etc/default/${DOCKER_USER_BUILMACHINE_TEMPLATE_CONFIG_FNAME}"
+  YOCTO_USER_DOCKER_FILE=""
+  #}
+
+  #YOCTO_BASE_DOCKER_FILES
+  #YOCTO_BASE_DOCKER_FILES1="${DOCKER_BUILD_DIRECTORY}/ubuntu14045_yocto_base.v4.docker"
+  #YOCTO_BASE_DOCKER_FILES2="${DOCKER_BUILD_DIRECTORY}/ubuntu1604_yocto_base.v1.docker"
+
+  #get_base_image_archive_path "${TEMP_INSTALLATION_DIRECTORY}" "${YOCTO_BASE_DOCKER_FILE}" YOCTO_BASE_IMAGE_FILE
+  #YOCTO_USER_DOCKER_FILE="${DOCKER_BUILD_DIRECTORY}/ubuntu14045_yocto_user.v2.docker"
+
+  ##DOCKER_YOCTO_BASE_IMG_NAME
+
+  #{ 
+  #get_image_name "${YOCTO_BASE_DOCKER_FILE}" "gandrys" DOCKER_YOCTO_BASE_IMG_NAME
+  #}
+
+  # { INSTALATIONFILES:
+  
+  #builmachine user install: all with exception ycimg, ymount, yocto, docker_user_default
+    #> ok default install >INSTALL_SERVICES="no", install_subsystem_files="no"
+  
+  #non-builmachine pc fresh install:
+    #>all with exception of INSTALL_SERVICES="no"
+  
+  #builmachine admin install: 
+    #>INSTALL_SERVICES="no", install_subsystem_files="yes"
+
+  SUBSYSTEM_FILES="ycimg sycimg ymount symount"
+  YOCTO_TOOLS__RELEASE_FILES_BASE="/usr/local/bin/ycimg /usr/local/bin/sycimg \
+                                    /usr/local/bin/ymount /usr/local/bin/symount\
+                                    /usr/local/bin/umess.sh \
+                                    ${DOCKER_USER_BUILMACHINE_TEMPLATE_CONFIG} \
+                                    /lib/systemd/system/docker_user_prep.sh \
+                                    /lib/systemd/system/docker_user_prep@.service \
+                                    /lib/systemd/system/docker_user@.socket \
+                                    /lib/systemd/system/docker_user@.service \
+                                    /lib/systemd/system/mounts_disconects@.service \
+                                    /lib/systemd/system/mounts_disconects@.timer"
+
+  # }
+
+  #Cases where docker related files are in different places are following:
+  #1)install : extract from file itself in base64      : + read names and add decode base64 and return file list;
+  # done>tested on ubuntu 16.04
+
+  #2)release : files are in src folder(skip this file) : + add fls to this file in base64 + add names;
+  # done>tested on ubuntu 16.04
+  #>YOCTO_TOOLS__RELEASE_FILES_BASE + search docker files and archives in src folder
+
+  #3)cdbimg : Create docker base image:
+  # done>tested on ubuntu 16.04
+  #Selectable by user
+
+  #4)run     : only necessary files are docker file and the they are in DOCKER_BUILD_DIRECTORY      :
+  #TODO:!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!2017.12.21
+
+  #--custom-img(choosing user_image),(without this input parameter always gives user choice from docker_build_dir)
+  # cdbimg(create base image )(choosing base image)
+  # and run(choosing user_image)(+add dependency functions )
+
+
+
+  ##YOCTO_BASE_DOCKER_FILE: egrep yocto_base.*v.*\.docker
+  ##YOCTO_USER_DOCKER_FILE: egrep yocto_user.*v.*\.docker
+  ##YOCTO_BASE_IMAGE_FILE:  egrep yocto_base.*v.*docker\..*tar\.bz2
+
+  
+  for arg in "$@"; do
+    
+    case "$arg" in 
+      help|--help|-h|\?)
+        help_desc
+        exit 0;
+      ;;
+      
+      install)
+        operation="install"
+      ;;
+      
+      cimg)
+      
+        if [ "${OS_STRING}" != "NATIVE_LINUX" ]; then
+          echo -e "\n  This command/option is not available in windows systems,\n please create image in Linux"
+          exit 1
+        fi
+        
+        operation="create_yocto_image_storage"
+      ;;
+      
+      run)
+        operation="run"
+        prep_yocto_user_docker_file=""
+      ;;
+      
+      cdbimg|cdbimg=*)
+        operation="prep_docker_create_base_image"
+        prep_yocto_base_docker_file=""
+        if [ ! "$arg" == "cdbimg" ]; then
+          prep_yocto_base_docker_file="${arg#*=}"
+        fi
+      ;;
+      
+      release|release=*)
+        operation="prep_script_update"
+        fls_dir=""
+        if [ ! "$arg" == "release" ]; then
+          fls_dir="${arg#*=}"
+        fi
+      ;;
+      
+      --add-base-image)
+        ADD_BASE_IMAGE="yes"
+      ;;
+      
+      --install-subsystem-files)
+        if [ "${OS_STRING}" != "NATIVE_LINUX" ]; then
+          echo -e "\n  This command/option is not available in windows systems,\n please create image in Linux"
+          exit 1
+        fi
+        INSTALL_SUBSYSTEM_FILES="yes"
+      ;;
+      
+      --install-services)
+        INSTALL_SERVICES="yes"
+      ;;
+      
+      --restart)
+        RESTART_DOCKER_MACHINE="yes"
+      ;;
+      
+      --custom-img|--custom-img=*|-c=*|-c)
+
+        if [ ! "$arg" == "--custom-img" ] && [ ! "$arg" == "-c" ]; then
+        #user selected docker_user file by parameter>
+          prep_yocto_user_docker_file="${arg#*=}"
+        fi
+
+      ;;
+      
+    esac
+  done
+
+  ##here we know what user wants
+  #==========================================================================================
+  if [ "$operation" != "install" ]; then
+  
+    DEPENDENCIES_LIST=( "grep --help 0" "egrep --help 0" "awk --help 0" "mkdir --help 0" "chmod --help 0" \
+                      "chown --help 0" "losetup --help 0" "kpartx --help 1" "mount --help 0" "id --help 0" \
+                      "smbstatus --help 1" "smbcontrol --help 1" "docker -v 0" "base64 --version 0" \
+                      "git --version 0" "bunzip2 --help 0" "qemu-img --help 0" "mkfs.ext4 -V 0" "fdisk --help 0")
+
+    if [ "${OS_STRING}" != "NATIVE_LINUX" ]; then
+  
+      VBOX_DOCKER_MACHINE_NAME="yocto-docker"
+      DEPENDENCIES_LIST+=( "docker-machine -v 0" )  
+      VBOX_YOCTO_VOLUME_NAME="yoctomnt"
+    
+      cygwin_get_vboxclitool 
+      ret=$?
+      [ "${ret}" != "0" ] && exit 1
+
+    fi
+  
+    dependencies_test
+    ret=$?
+    [ "${ret}" != "0" ] && exit 1
+    #========================================================================================== 
+
+    if [ "${OS_STRING}" != "NATIVE_LINUX" ]; then
+      cygwin_vbox_create_docker_machine
+    fi
+  
+    ##try2update
+  fi
+  #========================================================================================== 
+  
+  if [ "$operation" == "install" ]; then
+  
+    install_files "${YOCTO_DOCKER_USER__FILES_CHECK_LIST}" "${SUBSYSTEM_FILES}" "${TEMP_INSTALLATION_DIRECTORY}"
+
+  elif [ "$operation" == "create_yocto_image_storage" ]; then  
+    
+    DEPENDENCIES_LIST+=( "ycimg ? 0" )
+    dependencies_test
+    ret=$?
+    [ "${ret}" != "0" ] && exit 1
+  
+    ycimg
+    
+    
+  elif [ "$operation" == "run" ]; then  
+  
+    DEPENDENCIES_LIST+=( "ymount ? 0" )
+    dependencies_test
+    ret=$?
+    [ "${ret}" != "0" ] && exit 1
+
+    #TODO: here !!
+    #""
+    if [ -z "${prep_yocto_user_docker_file}"  ]; then
+      #find docker files build directory and propt user to select one
+      select_file "*_yocto_user*.v*.docker" "${DOCKER_BUILD_DIRECTORY}" YOCTO_USER_DOCKER_FILE
+      yocto_user_prep_dir="${YOCTO_USER_DOCKER_FILE%/*}"
+    else
+
+      bla_arr=( ${prep_yocto_user_docker_file////" "} );
+      if [ ${#bla_arr[@]} -eq 2 ] && [ ${bla_arr[0]} == "." ];then
+        #"./XXX " > in local fldr
+        yocto_user_prep_dir="$(pwd)"
+        YOCTO_USER_DOCKER_FILE="${yocto_user_prep_dir}/${bla_arr[1]}"
+      elif [ ${#bla_arr[@]} -eq 1 ] && [ ${bla_arr[0]} == "${prep_yocto_user_docker_file}" ]; then
+        #"XXX" with no slash > search in build dir or in local dir ..priority have local dir
+        if [ -e "${prep_yocto_user_docker_file}" ]; then
+          #if user did fill only name > at first search in current directory
+          #>first find in current folder
+            #./test.docker, #test.docker
+            #user enter only file name without path -> if current directory includes this file -> load
+          yocto_user_prep_dir="$(pwd)"
+          YOCTO_USER_DOCKER_FILE="${yocto_user_prep_dir}/${prep_yocto_user_docker_file}"
+        elif [ -e "${DOCKER_BUILD_DIRECTORY}/${prep_yocto_user_docker_file}" ]; then
+          #user enter only file name without path -> if build dir includes this file -> load
+          yocto_user_prep_dir="${DOCKER_BUILD_DIRECTORY}"
+          YOCTO_USER_DOCKER_FILE="${yocto_user_prep_dir}/${prep_yocto_user_docker_file}"
+        fi
+      else
+         #./sdfdsfd/XXX and more deeper
+         yocto_user_prep_dir="${prep_yocto_user_docker_file%/*}"
+         YOCTO_USER_DOCKER_FILE="${prep_yocto_user_docker_file}"
+      fi
+
+    fi
+
+    #only YOCTO_USER_DOCKER_FILE variable user can change from cmd line, so check if exist ..
+    if [ ! -e "${YOCTO_USER_DOCKER_FILE}" ]; then
+      echo -e "\n  Error: Docker file does not exists: "'"'${YOCTO_USER_DOCKER_FILE}'"'
+      exit 1
+    fi
+
+    yocto_run "${YOCTO_USER_DOCKER_FILE}" "${yocto_user_prep_dir}" "${TEMP_INSTALLATION_DIRECTORY}"
+    ret=$?
+    [ "${ret}" != "0" ] && exit 1
+    
+  elif [ "$operation" == "prep_docker_create_base_image" ]; then
+
+        if [ -z "${prep_yocto_base_docker_file}" ]; then
+          #if user did not fill path > let him choose from "${DOCKER_BUILD_DIRECTORY}"
+          #find docker files build directory and prompt user to select one
+          select_file "*yocto_base.v*.docker" "${DOCKER_BUILD_DIRECTORY}" YOCTO_BASE_DOCKER_FILE
+          yocto_base_prep_dir="${DOCKER_BUILD_DIRECTORY}"
+        else
+          bla_arr=( ${prep_yocto_base_docker_file////" "} );
+          if [ ${#bla_arr[@]} -eq 2 ] && [ ${bla_arr[0]} == "." ];then
+            #"./XXX test" > in local fldr
+            yocto_base_prep_dir="$(pwd)"
+          elif [ ${#bla_arr[@]} -eq 1 ] && [ ${bla_arr[0]} == "${prep_yocto_base_docker_file}" ]; then
+            #"XXX" with no slash > search in build dir or in local dir ..priority have local dir
+            if [ -e "${prep_yocto_base_docker_file}" ]; then
+              #if user did fill only name > at first search in current directory
+              #>first find in current folder
+                #./test.docker
+                #test.docker
+                #user enter only file name without path -> if current directory includes this file -> load
+              yocto_base_prep_dir="$(pwd)"
+              YOCTO_BASE_DOCKER_FILE="${yocto_base_prep_dir}/${prep_yocto_base_docker_file}"
+            elif [ -e "${DOCKER_BUILD_DIRECTORY}/${prep_yocto_base_docker_file}" ]; then
+              #user enter only file name without path -> if build dir includes this file -> load
+              yocto_base_prep_dir="${DOCKER_BUILD_DIRECTORY}"
+              YOCTO_BASE_DOCKER_FILE="${yocto_base_prep_dir}/${prep_yocto_base_docker_file}"
+            fi
+
+          else
+             yocto_base_prep_dir="${prep_yocto_base_docker_file%/*}"
+             YOCTO_BASE_DOCKER_FILE="${prep_yocto_base_docker_file}"
+          fi
+
+        fi
+
+    get_image_name "${YOCTO_BASE_DOCKER_FILE}" "gandrys" DOCKER_YOCTO_BASE_IMG_NAME
+    get_base_image_archive_path "${TEMP_INSTALLATION_DIRECTORY}" "${YOCTO_BASE_DOCKER_FILE}" _yocto_base_image_file
+
+    create_docker_image_archive_yocto_base "${YOCTO_BASE_DOCKER_FILE}" "${_yocto_base_image_file}" "${DOCKER_YOCTO_BASE_IMG_NAME}" "${yocto_base_prep_dir}"
+    
+  elif [ "$operation" == "prep_script_update" ]; then
+  
+    update_script_data2 "${YOCTO_TOOLS__RELEASE_FILES_BASE}" "${fls_dir}" "${BASE64_DATA_DOCKER_BUILD_DIRECTORY}" "${BASE64_DATA_TEMP_INSTALLATION_DIRECTORY}"
+
+  fi
+  
+  echo -e "\n"
+  exit 1
+}
+
+main "$@"
+exit 222
+
+BASE64_DATA_FILES:
+/usr/local/bin/ycimg
+IyEvYmluL2Jhc2gKIz09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09
+PT09PT09PT09PT09PT09PT09PT09PT09CiMgTkFNRSAgICAgICAgICA6ICAgICAgIHljaW1nCiMg
+QVVUSE9SICAgICAgICA6ICAgICAgIEFuZHJ5cyBKaXJpCiMgREFURSAgICAgICAgICA6ICAgICAg
+IDIwMTcuMTAuMzEKIyBWRVJTSU9OICAgICAgIDogICAgICAgMS40MQojIERFUEVOREVOQ0lFUzoK
+IyAgICAgICAgICAgICAgIDEpYmluYXJpZXM6IHFlbXUtaW1nLCBiYXNoLCBlZ3JlcCwgbWtkaXIs
+IGNobW9kLCBjaG93biwgaWQsIGdyZXAsIGRmCiMKIyBERVNDUklQVElPTiAgIDoKIyAgICAgICAg
+ICAgQ3JlYXRlIHJhdyBpbWFnZSBpbiBvcmRlciB0byB1c2UgaXQgYXMgY29udGFpbmVyIGZvciB5
+b2N0byBlbnZpcm9ubWVudAojCiMgIFZlcnNpb24gMS40IDoKIyAgID5OZXcgaW5wdXQgcGFyYW1l
+dGVycyBmb3IgYmFzaCBtb2RlIAojICAgICItLXVzZXI9IlVTRVJOQU1FIgojICAgICItLWltZy1z
+aXplLWdiPSJJTUFHRV9TSVpFX0lOX0dJR0FfQllURVMiCiMgICAgIi0taW1nLXBhdGg9IklNQUdF
+X1BBVEhfQU5EX0lNR19OQU1FX1dJVEhPVVRfRVhURU5TSU9OIgojPT09PT09PT09PT09PT09PT09
+PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0KCgpoZWxw
+X2Rlc2MgKCkgewplY2hvIC1lICJcCgpDcmVhdGUgUmF3IEltYWdlOgoKICBVc2FnZTogIHljaW1n
+IE9QVElPTlMKCiAgICAgICAgICBUd28gbW9kZXMgYXJlIGF2YWlsYWJsZTogCiAgICAgICAgICAg
+IDEpQWxsIGlucHV0IG9wdGlvbnMgaGF2ZSB0byBiZSBmaWxsZWQKICAgICAgICAgICAgMilObyBv
+cHRpb25zIGhhdmUgdG8gYmUgZmlsbGVkCiAgICAgICAgICAgIAogICAgICAgICAgd2hlcmUgT1BU
+SU9OUyBhcmUgID0gey0tdXNlcj0iVVNFUk5BTUUiIH0KICAgICAgICAgIAogICAgICAgICAgd2hl
+cmUgT1BUSU9OUyBhcmUgID0gey0taW1nLXNpemUtZ2I9IklNQUdFX1NJWkVfSU5fR0lHQV9CWVRF
+UyIgfQogICAgICAgICAgCiAgICAgICAgICB3aGVyZSBPUFRJT05TIGFyZSAgPSB7LS1pbWctcGF0
+aD0iSU1BR0VfUEFUSF9BTkRfSU1HX05BTUVfV0lUSE9VVF9FWFRFTlNJT04iIH0KIgp9CgoKcnVu
+YXN1c2VyPSIiCmltYWdlX3NpemVfZ2I9IiIKaW1nX3B0aD0iIgppbWdfbmFtZT0iIgppbWdfZGly
+PSIiCmludGVyYWN0aXZlX21vZGU9IiIKCmZvciBhcmcgaW4gIiRAIjsgZG8KICBjYXNlICIkYXJn
+IiBpbiAKICAgIC0taGVscHwtaHxoZWxwfFw/KQogICAgICBoZWxwX2Rlc2MKICAgICAgZXhpdCAw
+OwogICAgOzsKICAgIAogICAgLS11c2VyPSopCiAgICAgIHJ1bmFzdXNlcj0iJHthcmcjKj19Igog
+ICAgOzsKICAgIAogICAgLS1pbWctc2l6ZS1nYj0qKQogICAgICBpbWFnZV9zaXplX2diPSIke2Fy
+ZyMqPX0iCiAgICA7OwoKICAgIC0taW1nLXBhdGg9KikKICAgICAgaW1nX3B0aD0iJHthcmcjKj19
+IgogICAgICBpbWdfbmFtZT0iJHtpbWdfcHRoIyMqL30iCiAgICAgIGltZ19kaXI9IiR7aW1nX3B0
+aCUvKn0iCiAgICA7OwogIGVzYWMKZG9uZQoKI1dlIGNhbiBub3QgYWxsb3cgbm9ybWFsIHVzZXIo
+dWlkIT0wKSBydW4gYXMgZGlmZmVyZW50IHVzZXIgLi4KIwppZiBbICIke3J1bmFzdXNlcn0iICE9
+ICIiIF07IHRoZW4KICAjVE9ETzpJZiB3ZSBkbyBub3QgaGF2ZSB0aGlzIHdlIGFsbG93IGFueSB1
+c2VyIHJ1biBzeW1vdW50IGFzIHJvb3Q+d3JvbmcsIHdlIGhhdmUgdG8ga2ljayBvdXQgdXNlciBm
+cm9tIGhlcmUKICBpZiBbICQoaWQgLXUpICE9IDAgXTsgdGhlbgogICAgZWNobyAiIEVycm9yOiBQ
+bGVhc2UgcnVuIHRoaXMgY29tbWFuZCBhcyByb290IgogICAgZWNobyAiIgogICAgZXhpdCAxCiAg
+ZmkKICBsb2dnZWRfdXNlcl9pZF89JChpZCAtdSAiJHtydW5hc3VzZXJ9IikKICBsb2dnZWRfdXNl
+cl9uYW1lXz0kKGlkIC11biAiJHtydW5hc3VzZXJ9IikKZWxzZQogIGxvZ2dlZF91c2VyX2lkXz0k
+KGlkIC11KQogIGxvZ2dlZF91c2VyX25hbWVfPSQoaWQgLXVuKQpmaQoKCmlmIFsgIiR7aW1hZ2Vf
+c2l6ZV9nYn0iID09ICIiIF0gJiYgWyAiJHtpbWdfcHRofSIgPT0gIiIgXTsgdGhlbgogIGludGVy
+YWN0aXZlX21vZGU9InkiCgplbGlmIFsgIiR7aW1hZ2Vfc2l6ZV9nYn0iICE9ICIiIF0gJiYgWyAi
+JHtpbWdfcHRofSIgIT0gIiIgXTsgdGhlbgogIGludGVyYWN0aXZlX21vZGU9IiIKCmVsc2UKICBl
+Y2hvICJFcnJvcjogQWxsIHBhcmFtZXRlcnMgb24gYW55IHBhcmFtZXRlcnMgaGF2ZSB0byBiZSBz
+ZXQiCiAgZXhpdCAxCmZpCiMgSU5QVVQgUEFSQU1FVEVSUyA9PT09PT09PT09PT09PT09PT09PT09
+PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0KCiNpZCAtdW4Kc3Vk
+byAvdXNyL2xvY2FsL2Jpbi9zeWNpbWcgIiR7bG9nZ2VkX3VzZXJfaWRffSIgIiR7bG9nZ2VkX3Vz
+ZXJfbmFtZV99IiAiJHtpbWFnZV9zaXplX2difSIgIiR7aW1nX25hbWV9IiAiJHtpbWdfZGlyfSIg
+IiR7aW50ZXJhY3RpdmVfbW9kZX0iCg==
+
+/usr/local/bin/sycimg
+IyEvYmluL2Jhc2gKIz09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09
+PT09PT09PT09PT09PT09PT09PT09PT09CiMgTkFNRSAgICAgICAgICA6ICAgICAgIHljaW1nCiMg
+QVVUSE9SICAgICAgICA6ICAgICAgIEFuZHJ5cyBKaXJpCiMgREFURSAgICAgICAgICA6ICAgICAg
+IDIwMTcuMTAuMzEKIyBWRVJTSU9OICAgICAgIDogICAgICAgMS40MQojIERFUEVOREVOQ0lFUzoK
+IyAgICAgICAgICAgICAgIDEpYmluYXJpZXM6IHFlbXUtaW1nLCBiYXNoLCBlZ3JlcCwgbWtkaXIs
+IGNobW9kLCBjaG93biwgaWQsIGdyZXAsIGRmCiMKIyBERVNDUklQVElPTiAgIDoKIyAgICAgICAg
+ICAgQ3JlYXRlIHJhdyBpbWFnZSBpbiBvcmRlciB0byB1c2UgaXQgYXMgY29udGFpbmVyIGZvciB5
+b2N0byBlbnZpcm9ubWVudAojCiMgIFZlcnNpb24gMS40IDoKIyAgID5OZXcgaW5wdXQgcGFyYW1l
+dGVycyBmb3IgYmFzaCBtb2RlIAojICAgICItLXVzZXI9IlVTRVJOQU1FIgojICAgICItLWltZy1z
+aXplLWdiPSJJTUFHRV9TSVpFX0lOX0dJR0FfQllURVMiCiMgICAgIi0taW1nLXBhdGg9IklNQUdF
+X1BBVEhfQU5EX0lNR19OQU1FX1dJVEhPVVRfRVhURU5TSU9OIgojPT09PT09PT09PT09PT09PT09
+PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0KCgojUmV0
+dXJuIGZpcnN0IGZyZWUgbG9vcGRldmljZSBudW1iZXIgb2YgZ2l2ZW4gdXNlcjoKIyAgIEBwYXJh
+bSAgOiBbb3V0cHV0XSAgOiAgICAgICAkMSAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIGxv
+b3BkZXZfbnVtXwojICAgQHJldCAgICA6ICAgICAgICAgICAgICAgICAgIGlmIFsgJD8gIT0gMCBd
+OyB0aGVuIC0+IGVycm9yCmdldF9mcmVlbG9vcGRldl9udW0oKSB7CgogICMvZGV2L21hcHBlci9s
+b29wMXAxIG9uIC9tbnQvamlyaS92bXdhcmUxCiAgI21vdW50IHwgZWdyZXAgImRldi4qbWFwcGVy
+Lipsb29wLioke2xvZ2dlZF91c2VyX25hbWVffSIKICAjdGVzdD0vZGV2L21hcHBlci9sb29wMXAx
+CgogIGxvY2FsIF9maXJzdF9sb29wZGV2X251bT0kKCggJHtMT09QREVWX1NUQVJUX09GRlNFVH0g
+KyAoJHtVU0VSX0xPT1BERVZfTUFYfSAqICgke2xvZ2dlZF91c2VyX2lkX30gLSAke0xPV0VTVF9V
+U0VSX0lEfSkpICApKQogIAogIGZvciAoKF9qPTA7IF9qPCIke1VTRVJfTE9PUERFVl9NQVh9Ijtf
+aisrICkpOyBkbwogICAgbG9jYWwgX2xvb3BkZXZfbnVtPSQoKCR7X2ZpcnN0X2xvb3BkZXZfbnVt
+fSske19qfSkpCiAgICBsb2NhbCBfaXN1c2VkPWBzdWRvIGxvc2V0dXAgLWEgfCBlZ3JlcCAiZGV2
+Lipsb29wJHtfbG9vcGRldl9udW19OiJgCiAgICBpZiBbIC16ICIke19pc3VzZWR9IiBdO3RoZW4g
+eyBsb2NhbCBfcmV0PSQxOyBldmFsICRfcmV0PSR7X2xvb3BkZXZfbnVtfTsgcmV0dXJuIDA7IH07
+IGZpCiAgZG9uZQoKICAjRXJyb3I6IGFueSBhdmFpbGFibGUgbG9vcCBkZXZpY2VzIGZvciBnaXZl
+biB1c2VyCiAgbG9jYWwgX3JldD0iJDEiOyBldmFsICRfcmV0PSIiOyByZXR1cm4gMTsKfQoKCmNy
+ZWF0ZV9pbWcoKSB7CgogICNXZSBzaG91bGQgbm90IGFsbG93IHVzZXIgdG8gc2F2ZSB0byBsb2Nh
+dGlvbiB3aG8gZG9lcyBub3QgaGF2ZSByaWdodAogIHN1ZG8gLXUgIiR7bG9nZ2VkX3VzZXJfbmFt
+ZV99IiBxZW11LWltZyBjcmVhdGUgLWYgcmF3IC1vIHNpemU9IiRpbWFnZV9zaXplX2diIiJHIiAi
+JGltZ19kaXIiIiRpbWdfbmFtZSIiLnFlbXVyYXdpbWciCiAgI1RPRE86IGVyciB0ZXN0CiAgZXJy
+Xz0kPwogIGlmIFsgIiR7ZXJyX30iICE9IDAgXTsgdGhlbgogICBlY2hvICJFcnJvcjogSW1hZ2Ug
+ZmlsZS4gRXhpdGluZyIKICAgZXhpdCAxCiAgZmkKICBzdWRvIGNobW9kIGd1K3IrdyAiJGltZ19k
+aXIiIiRpbWdfbmFtZSIiLnFlbXVyYXdpbWciCiAgc3VkbyBjaG93biAiJHtsb2dnZWRfdXNlcl9u
+YW1lX30iOnJvb3QgIiRpbWdfZGlyIiIkaW1nX25hbWUiIi5xZW11cmF3aW1nIgogIGVjaG8gIiIK
+CiAgc2xlZXAgNQoKICBpZiBbICEgLWYgIiRpbWdfZGlyIiIkaW1nX25hbWUiIi5xZW11cmF3aW1n
+IiBdOyB0aGVuCiAgICBlY2hvICJFcnJvcjogVW5hYmxlIHRvIGNyZWF0ZSBpbWFnZSBmaWxlLiBF
+eGl0aW5nIgogICAgZXhpdCAxCiAgZmkKCiAgc3VkbyBsb3NldHVwICIvZGV2L2xvb3AiIiRmcmVl
+ZGV2IiAiJGltZ19kaXIiIiRpbWdfbmFtZSIiLnFlbXVyYXdpbWciIAogIHNsZWVwIDMKICBzeW5j
+CiAgZWNobyAiIgoKZWNobyAidwoiIHwgc3VkbyBmZGlzayAiL2Rldi9sb29wIiIkZnJlZWRldiIK
+c3luYwpzbGVlcCAxCnN1ZG8gbG9zZXR1cCAtZCAiL2Rldi9sb29wIiIkZnJlZWRldiIKc3luYwpz
+bGVlcCAxCgpzdWRvIGxvc2V0dXAgIi9kZXYvbG9vcCIiJGZyZWVkZXYiICIkaW1nX2RpciIiJGlt
+Z19uYW1lIiIucWVtdXJhd2ltZyIKc3luYwpzbGVlcCAxCmVjaG8gIiIKCmVjaG8gIm4KcAoxCgoK
+dwoiIHwgc3VkbyBmZGlzayAiL2Rldi9sb29wIiIkZnJlZWRldiIKc3luYwpzbGVlcCAxCnN1ZG8g
+bG9zZXR1cCAtZCAiL2Rldi9sb29wIiIkZnJlZWRldiIKc3luYwpzbGVlcCAxCgpzdWRvIGxvc2V0
+dXAgIi9kZXYvbG9vcCIiJGZyZWVkZXYiICIkaW1nX2RpciIiJGltZ19uYW1lIiIucWVtdXJhd2lt
+ZyIKc3luYwpzbGVlcCAxCmVjaG8gIiIKCnN1ZG8ga3BhcnR4IC1hICIvZGV2L2xvb3AiIiRmcmVl
+ZGV2IgpzeW5jCnNsZWVwIDIKCgpzdWRvIG1rZnMuZXh0NCAiL2Rldi9tYXBwZXIvbG9vcCIiJGZy
+ZWVkZXYiInAxIgpzeW5jCmVjaG8gIiIKCnNsZWVwIDEKCnN1ZG8ga3BhcnR4IC1kICIvZGV2L2xv
+b3AiIiRmcmVlZGV2IgpzeW5jCnNsZWVwIDIKCnN1ZG8gbG9zZXR1cCAtZCAiL2Rldi9sb29wIiIk
+ZnJlZWRldiIKc3luYwpzbGVlcCA1Cgp9CgptYWluKCkgewoKICBERUxJTT0ifC1SQVdfSU1BR0Ut
+LS0tLS0tLS0tLS0tLS0tLS0tLS0tLSIKCiAgZWNobyAiIgogIGVjaG8gIkNyZWF0aW5nIHlvY3Rv
+IHJhdyBpbWFnZToiCiAgZWNobyAiJERFTElNIgogIGVjaG8gIiIKCiAgZ2V0X2ZyZWVsb29wZGV2
+X251bSAiZnJlZWRldiIKICByZXQ9IiQ/IgogIGVjaG8gIiIKICBpZiBbICIke3JldH0iIC1lcSAx
+IF07IHRoZW4KICAgIGVjaG8gJyAgRXJyb3I6IEFueSBhdmFpbGFibGUgbG9vcCBkZXZpY2VzIGZv
+ciBnaXZlbiB1c2VyICEnCiAgICBlY2hvICcgICAgICAgICBQbGVhc2UgdW5tb3VudCBhbGwgeW91
+ciBpbWFnZXMgYnkgInltb3VudCB1bm1vdW50IiB0aGVuIHJ1biBpdCBhZ2FpbicKICAgIGVjaG8g
+JyAgICAgICAgIEV4aXRpbmcgJyAKICAgIGV4aXQgMQogIGZpCiAgCiAgaWYgWyAiJHtpbnRlcmFj
+dGl2ZV9tb2RlfSIgPT0gInkiIF07IHRoZW4KICAgIGVjaG8gIiAgSW50ZXJhY3RpdmUgTW9kZToi
+CiAgICAKICAgIGVjaG8gIiAgRW50ZXIgdGhlIGltYWdlIHNpemUobnVtYmVyIG9ubHkpIGluIHVu
+aXRzIG9mIEdCKGdpZ2EgYnl0ZXMpOiAiCiAgICByZWFkIC1wICIgID4iIGltYWdlX3NpemVfZ2IK
+ICAgIGVjaG8gIiIKCiAgICBlY2hvICIgIEVudGVyIHRoZSBuYW1lIG9mIGltYWdlLCB3aXRob3V0
+IGV4dGVudGlvbjogICIKICAgIHJlYWQgLXAgIiAgPiIgaW1nX25hbWUKICAgIGVjaG8gIiIKCiAg
+ICBlY2hvICIgRW50ZXIgdGhlIGRpcmVjdG9yeSBvZiBpbWFnZSIKICAgIHJlYWQgLWUgLXAgIiAg
+PiIgaW1nX2RpcgogICAgZWNobyAiIiAgCiAgICAKICAgIGlmIFsgLXogIiR7aW1nX2Rpcn0iIF07
+IHRoZW4gCiAgICAgIGVjaG8gIiAgSW1hZ2Ugd2lsbCBiZSBjcmVhdGVkIGluIGN1cnJlbnQgZGly
+ZWN0b3J5OiAiJyInJChwd2QpJyInCiAgICAgIGltZ19kaXI9JChwd2QpCiAgICBmaQogICAgCiAg
+ZWxzZQogICAgZWNobyAiICBCYXNoIE1vZGU6IgogIGZpCgogIAogIGlmIFsgISAtZCAiJHtpbWdf
+ZGlyfSIgXTsgdGhlbgogICAgZWNobyAiICAgRXJyb3I6IFBhdGggZG9lcyBub3QgZXhpc3RzISIK
+ICAgIGV4aXQgMQogIGVsc2UKICAgICNidWcgaW4gZGYsIGluIGNhc2UgdGhhdCBzaXplIG9uIGlt
+YWdlIGlzIHNtYWxsZXIgdGhhbiBkZWZpbmVkIHVuaXQoLUJYKSwgdGhlbiBldmVyeXRpbWUgc2hv
+dyBudW1iZXIgMSAhISEKICAgIGZyZWVzcGFjZT0kKGRmIC1CSyAiJGltZ19kaXIiIHwgYXdrICdG
+TlI+MXsgcHJpbnQgJDR9JykKICAgICNmcmVlZXNwYWNlIGluIEtCCiAgICBmcmVlc3BhY2VfS0I9
+JHtmcmVlc3BhY2U6Oi0xfQogICAgaW1nX3NpemVfS0I9JCgoJHtpbWFnZV9zaXplX2difSoxMDAw
+MDAwKSkKICAgIGVjaG8gLWUgIiAgSW1hZ2Ugc2l6ZTpcdCAiIiRpbWdfc2l6ZV9LQiIiS0IiCiAg
+ICBlY2hvIC1lICIgIEZyZWUgc3BhY2U6XHQgIiIkZnJlZXNwYWNlX0tCIiJLQlxuIgogICAgaWYg
+WyAiJHtpbWdfc2l6ZV9LQn0iIC1ndCAiJHtmcmVlc3BhY2VfS0J9IiBdOyB0aGVuCiAgICAgIGVj
+aG8gLWUgIlxuICBFcnJvcjpOb3QgZW5vdWdodCBmcmVlIHNwYWNlIGZvciBpbWFnZSBpbiBmb2xk
+ZXIiCiAgICAgIGV4aXQgMQogICAgZmkKICBmaQogIAogIGlmIFsgISAiJHtpbWdfZGlyOiAtMX0i
+ID09ICIvIiBdOyB0aGVuIAogICAgaW1nX2Rpcj0iJHtpbWdfZGlyfSIiLyIKICBmaQoKICBjcmVh
+dGVfaW1nCiAgCmVjaG8gIiRERUxJTSIKZWNobyAiIgoKfQoKIyBJTlBVVCBQQVJBTUVURVJTID09
+PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09
+PT09PT09PQoKI0V4cG9ydCBzZXR0aW5ncyBmcm9tIHltb3VudAojLiB5bW91bnQgc2V0dGluZ3Mg
+Pi9kZXYvbnVsbAp5bW91bnRfc2V0dGluZ3NfYXJyPSggJCgvdXNyL2xvY2FsL2Jpbi95bW91bnQg
+c2V0dGluZ3MpICkKZXZhbCAiJHt5bW91bnRfc2V0dGluZ3NfYXJyW0BdfSIKCiNlY2hvICRMT09Q
+REVWX1NUQVJUX09GRlNFVAojZWNobyAkTE9XRVNUX1VTRVJfSUQKI2VjaG8gJFVTRVJfTE9PUERF
+Vl9NQVgKCiMgSU5QVVQgUEFSQU1FVEVSUyA9PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09
+PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0KCmxvZ2dlZF91c2VyX2lkXz0iJDEi
+CmxvZ2dlZF91c2VyX25hbWVfPSIkMiIKaW1hZ2Vfc2l6ZV9nYj0iJDMiCmltZ19uYW1lPSIkNCIK
+aW1nX2Rpcj0iJDUiCmludGVyYWN0aXZlX21vZGU9IiQ2IgoKI2VjaG8gImN1cnJlbnQiCiNpZCAt
+dW4KI2VjaG8gImZyb20gcGFyYW1zIi4veWMKI2VjaG8gImltZ19kaXI9JGltZ19kaXIiCiNlY2hv
+ICJsb2dnZWRfdXNlcl9uYW1lXz0kbG9nZ2VkX3VzZXJfbmFtZV8iCgptYWlu
+
+/usr/local/bin/ymount
+IyEvYmluL2Jhc2gKIz09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09
+PT09PT09PT09PT09PT09PT09PT09PT09CiMgTkFNRSAgICAgIDogICB5bW91bnQKIyBBVVRIT1Ig
+ICAgOiAgIEFuZHJ5cyBKaXJpCiMgREFURSAgICAgIDogICAyMDE3LjExLjA4CiMgVkVSU0lPTiAg
+IDogICAwLjIuNQojCiMgREVQRU5ERU5DSUVTOgojICAgICAgICAgICAgICAgMSkgYmluYXJpZXM6
+IGJhc2gsIGdyZXAsIGVncmVwLCBhd2ssIG1rZGlyLCBjaG1vZCwgY2hvd24sIAojICAgICAgICAg
+ICAgICAgICAgbG9zZXR1cCwga3BhcnR4LCBtb3VudCwgaWQsIHNtYnN0YXR1cywgc21iY29udHJv
+bAojCiMgICAgICAgICAgICAgICAyKSBQYXRoIHRvIFlvY3RvIGltYWdlIGhhdmUgdG8gaW5jbHVk
+ZSB1c2VybmFtZVt4eHh4eHhdIAojICAgICAgICAgICAgICAgICAgYW5kIGltYWdlIG11c3QgaGF2
+ZSBleHRlbnRpb24gKi5xZW11cmF3aW1nLgojCiMgREVTQ1JJUFRJT046CiMgICAgICAgICAgICAg
+U2NyaXB0IGZvciBtb3VudGluZyByYXcgaW1hZ2VzIHdpdGggbXVsdGktdXNlciBzdXBwb3J0Lgoj
+ICAgICAgICAgICAgIFdpdGhvdXQgcGFyYW1ldGVycywgc2NyaXB0IHdpbGwgbW91bnQuCiMKIwoj
+CU51bWJlciBvZiBsb29wIGRldmljZSBpcyBnaXZlbiBieSB1aWQ6CiMJID5maXJzdF9sb29wZGV2
+X251bT0odWlkLTEwMDApKjMKIwojCUV2ZXJ5IHVzZXIgaGF2ZSBtYXggMyBsb29wIGRldmljZXM6
+CiMJID51aWQ9MTAwMDtmaXJzdF9sb29wZGV2X251bT0wO3swLDEsMn07CiMJID51aWQ9MTAwMTtm
+aXJzdF9sb29wZGV2X251bT0zO3szLDQsNX07CiMJID51aWQ9MTAwMjtmaXJzdF9sb29wZGV2X251
+bT02O3s2LDcsOH07CiMKIwlJbiBvcmRlciB0byBhY2Nlc3MgbWFjaGluZSBtb3VudHMgZWFzaWx5
+IGJ5IG9uZSBjaWZzIGNvbm5lY3Rpb24gCiMgICBhbmQgYmVpbmcgYWJsZSB0byB3b3JrIG9uIG11
+bHRpcGxlIGltYWdlcyBhdCBzYW1lIHRpbWUgd2l0aCBsZXNzIHBvc3NpYmxlIGNvbmZpZ3VyYXRp
+b24sCiMgICB0aGVuIGV2ZXJ5IFlvY3RvIGltYWdlIGlzIGF0IGZpcnN0IG1vdW50ZWQgdG8gIi9t
+bnQvJHt1c2VyfS92ZFgiIAojCWFuZCB0aGVuIHRoYXQgdG8gIi9vcHQvJHt1c2VyfS93b3JrcyIK
+IwojCUZvbGxvd2luZyBmb2xkZXJzIGhhdmUgdG8gZXhpc3RzIGluIEJ1aWxkTWFjaGluZToKIwk+
+Ii9tbnQvJHt1c2VyfS92ZDAiLCAiL21udC8ke3VzZXJ9L3ZkMSIsICIvbW50LyR7dXNlcn0vdmQy
+IgojCT4iL29wdC8ke3VzZXJ9L3dvcmtzIgojCiMJRm9sbG93aW5nIGZvbGRlcnMgaGF2ZSB0byBl
+eGlzdHMgaW4gaW1hZ2UgZHVlIHRvIHNlY29uZGFyeSBtb3VudDoKIwk+Ii9vcHQvJHt1c2VyfS93
+b3JrcyIKIwojCVRlc3RlZCBvbiBmb2xsb3dpbmcgRXZpcm9ubWVudHM6CiMJPlVidW50dSAxMi4w
+NCBMVFMsIDE0LjA0IExUUwojCT5VYnVudHUgMTYuMDQgTFRTCiMKIwlWZXJzaW9uIDAuMi4xIDoK
+Iwk+QWRkZWQgZnVuY3Rpb24gZm9yIGRldGVjdGlvbiBvZiBsb2NrZWQgZmlsZXMgYnkgc2FtYmEg
+YW5kIHNhbWJhIHNlc3Npb24ga2lsbGluZyAKIwk+QWRkZWQgZnVuY3Rpb24gZm9yIGRldGVjdGlv
+biBvZiBsb2NhbCB1c2VkIGZpbGVzIGFuZCBvZmZlciB0byB1c2VyIHRvIGtpbGwgdGhlbQojCT5B
+ZGRlZCBtaXNzaW5nIGRlcGVuZGVuY2llcyAKIwojCVZlcnNpb24gMC4yLjIgOgojICAgPjEuIFNt
+YWxsIGNoYW5nZXMgaW4gY29tbWVudHMgYW5kIHNvdXJjZSBjb2RlIAojICAgPjIuIEFkZGVkIHNj
+cmlwdCBwYXJhbWV0ZXJzOgojICAgPiJtb3VudHxtb3VudD0qfC0tbW91bnQ9KnwtbT0qIiAKIyAg
+ICAgLT4gV2hlbiBhZGRlZCwgc2NyaXB0IHdpbGwgbW91bnQgaW1hZ2UsIHBhcmFtZXRlciB2YWx1
+ZSBpbmNsdWRlcyBwYXRoIHRvIGltYWdlIGZpbGUuIAojICAgICAgICBJbiBjYXNlIG9mIG1pc3Np
+bmcgcGFyYW1ldGVyIHZhbHVlLCBzY3JpcHQgd2lsbCBhc2sgZm9yIHBhdGggdG8gaW1hZ2UgZmls
+ZS4KIwojICAgPiItLW5vLW9wdC1tb3VudHwtLW5vLW9wdHwtbiIgCiMgICAgIC0+IFdoZW4gYWRk
+ZWQsIHNjcmlwdCB3aWxsIHNraXAgc2Vjb25kIG1vdW50aW5nIHBvaW50IHRvIC9vcHQvJFVTRVIv
+d29ya3MuCiMgICAgICAgIFBhcmFtZXRlciBpcyBhcHBsaWVkIG9ubHkgaW4gY2FzZSBvZiBtb3Vu
+dGluZy4KIwojICAgPiItLW1vdW50LXBvaW50LWlkPSp8LWk9KiIKIyAgICAgICBXaGVuIGFkZGVk
+LCBhbmQgaWYgL21udC8kVVNFUi92ZCR7TU9VTlRfUE9JTlRfSURfTlVNQkVSfSBpcyBmcmVlIHRo
+ZW4gdHJ5IHRvIG1vdW50IGltYWdlIHRvIHRoaXMgcG9pbnQuCiMKIwlWZXJzaW9uIDAuMi4zIDoK
+IyAgIEJ1ZyBpbiBjYXNlIG9mIHVidW50dSAxNi4wNDogVW5hYmxlIHRvIGRldGVjdCBhbHJlYWR5
+IG1vdW50ZWQgL29wdC8kVVNFUi93b3Jrcy4KIyAgIE1pbm9yaXR5IGNoYW5nZXMgaW4gdXNlciBw
+cm9tcHRzLgojCiMgICBWZXJzaW9uIDAuMi40IDoKIyAgID4xKXByZXBhcmVfZGlyc19pbl9pbWFn
+ZSgpOkFkZCBzdXBwb3J0IGZvciBtdWx0aXBsZSBtb3VudGVkIGltYWdlcyBpbiBjYXNlIHRoYXQg
+Y3VycmVudCBpbWFnZSBkbyBub3QgaGF2ZSB5b2N0byBmb2xkZXJzCiMgICA+MilBZGRlZCBzY3Jp
+cHQgcGFyYW1ldGVycyBmb3IgZG9ja2VyIHNlcnZpY2VzIGFuZCBhbHNvIGFibGUgdG8gbW91bnQg
+Zm9yIGFueSB1c2VyIGFzIHJvb3Qgd2l0aCBoZWxwIG9mIC0tdXNlciBwYXJhbWV0ZXI6CiMgICA+
+Ii0tdXNlcj0qIiAKIyAgICAgICAtPndoZW4gYWRkZWQgc2NyaXB0IHN1cHBvc2UgdGhhdCBpbnRl
+cmFjdGl2ZSB1c2VyIGlucHV0IGlzIGRpc2FibGVkLCAKIyAgICAgICAgIHRoZXJlZm9yZSBhbGwg
+cGFyYW1ldGVycyBoYXZlIHRvIGJlIGZpbGVkIGFzIGlucHV0IHBhcmFtZXRlcnMgb2Ygc2NyaXB0
+CiMKIyAgID4iLS1tb3VudC1wb2ludC1pZD0qfC1pPSoiCiMgICAgICAgLT51c2VkIGFsc28gaW4g
+Y2FzZSBvZiB1bm1vdW50IAojICAgPjMpU3BlZWQtdXAgbW91bnQgcHJvY2VzcyBpbnN0ZWFkIG9m
+IHNsZWVwIGFkZCBjaGVjayBsb29wcyB3YWl0Zm9ybG9vcGRldigpLCB3YWl0Zm9yZmlsZSgpCiMK
+IyAgIFZlcnNpb24gMC4yLjUgOgojICAgPjEpYWRkIHN1cHBvcnQgZm9yIC0tY2hlY2staW1nLWRp
+cnMgaW4gY2FzZSBvZiAtbiBvcHRpb24gZm9yIHlvY3RvIHRvb2xzIGFuZCAtbiBvcHRpb24KIyAg
+ID4yKWFkZCBzdXBwb3J0IGZvciAtLXVubW91bnQtYWxsCiMgICA+MylhZGQgbmV3IG9wZXJhdGlv
+biA+IHNldHRpbmdzLAojICAgICAgICAgICAgICAgICAgICAgICAgICBwcmludCBvbmx5IHNldHRp
+bmdzIGFuZCBleHBvcnQgdG8gZW52IExPT1BERVZfU1RBUlRfT0ZGU0VULCBMT1dFU1RfVVNFUl9J
+RCwgVVNFUl9MT09QREVWX01BWAojICAgICAgICAgICAgICAgICAgICAgICAgICB1c2VmdWxsIGZv
+ciBvdGhlciB0b29scyB5Y2ltZyBhbmQgeW9jdG8KIyAgID40KWFkZCBuZXcgb3BlcmF0aW9uID4g
+aW5mbywKIyAgICAgICAgICAgICAgICAgICAgICAgICAgcHJpbnQgbW91bnRlZCBkZXZpY2VzIGZv
+ciBnaXZlbiB1c2VyCiMgIFZlcnNpb24gMC4yLjYgOgojICA+dGVzdGluZyBzdWlkIC4uLgojPT09
+PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09
+PT09PT09PT0KTE9PUERFVl9TVEFSVF9PRkZTRVQ9NQpMT1dFU1RfVVNFUl9JRD0xMDAwClVTRVJf
+TE9PUERFVl9NQVg9MwpJTUFHRV9ESVI9Ii9tbnQiCiM9PT09PT09PT09PT09PT09PT09PT09PT09
+PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PQoKaGVscF9kZXNjICgpIHsKZWNobyAtZSAi
+XAoKVXNhZ2U6ICB5bW91bnQgT1BFUkFUSU9OIE9QVElPTlMKCiAgICAgICAgd2hlcmUgT1BFUkFU
+SU9OID0geyBtb3VudCB8IG1vdW50PSJQQVRIMklNQUdFIiB8IC0tbW91bnQ9IlBBVEgySU1BR0Ui
+IHwgLW09IlBBVEgySU1BR0UiIH0KCiAgICAgICAgICAgICAgICBNb3VudCBkcml2ZSB0byB0aGUg
+Zm9sbG93aW5nIGRlc3RpbmF0aW9uczoKICAgICAgICAgICAgICAgICAgIDEpL21udC9VU0VSX05B
+TUUvdmRYLCB3aGVyZSBYIGlzIG1vdW50IHBvaW50IElECiAgICAgICAgICAgICAgICAgICAyKS9v
+cHQvVVNFUl9OQU1FL3dvcmtzCgogICAgICAgICAgICAgICAgd2hlcmUgcmVsYXRlZCBPUFRJT05T
+IGFyZSAgPSB7LS1uby1vcHQtbW91bnQgfCAtLW5vLW9wdCB8IC1uIH0KICAgICAgICAgICAgICAg
+IHdoZXJlIHJlbGF0ZWQgT1BUSU9OUyBhcmUgID0gey0tY2hlY2staW1nLWRpcnMgfCAtYyB9LAog
+ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICB2YWxpZCBvbmx5IGlu
+IGNhc2Ugb2YgLS1uby1vcHQtbW91bnQKICAgICAgICAgICAgICAgIHdoZXJlIHJlbGF0ZWQgT1BU
+SU9OUyBhcmUgID0gey0tbW91bnQtcG9pbnQtaWQ9IklEIiB8IC1pPSJJRCIgfSAKICAgICAgICAg
+ICAgICAgIHdoZXJlIHJlbGF0ZWQgT1BUSU9OUyBhcmUgID0gey0tdXNlcj0iVVNFUk5BTUUiIH0K
+CgogICAgICAgIHdoZXJlIE9QRVJBVElPTiA9IHsgdW5tb3VudCB9CgogICAgICAgICAgICAgICB3
+aGVyZSByZWxhdGVkIE9QVElPTlMgYXJlICA9IHstLXVzZXI9IlVTRVJOQU1FIiB9CiAgICAgICAg
+ICAgICAgIHdoZXJlIHJlbGF0ZWQgT1BUSU9OUyBhcmUgID0gey0tbW91bnQtcG9pbnQtaWQ9IklE
+IiB8IC1pPSJJRCIgfQogICAgICAgICAgICAgICB3aGVyZSByZWxhdGVkIE9QVElPTlMgYXJlICA9
+IHstLXVubW91bnQtYWxsIHwgLS11bW91bnQtYWxsIHwgLWEgfQoKICAgICAgICB3aGVyZSBPUEVS
+QVRJT04gPSB7IHNldHRpbmdzIH0KCiAgICAgICAgICAgICAgIFByaW50IHNldHRpbmdzOgogICAg
+ICAgICAgICAgICAgIExPT1BERVZfU1RBUlRfT0ZGU0VULCBMT1dFU1RfVVNFUl9JRCwgVVNFUl9M
+T09QREVWX01BWAoKICAgICAgICAgICAgICAgICAxKUxPT1BERVZfU1RBUlRfT0ZGU0VUCiAgICAg
+ICAgICAgICAgICAgICBTb21lIG90aGVyIHRvb2xzIHN1Y2ggYXMgbGlidmlydCwgcWVtdSwgd213
+YXJlIG1heSB1c2UgL2Rldi9sb29wXCRERVZJQ0VfTlVNQkVSIGRldmljZXMuCiAgICAgICAgICAg
+ICAgICAgICBUaGlzIHZhcmlhYmxlIGlzIHVzZWQgYXMgZmlyc3QgbG9vcCBkZXZpY2UgbnVtYmVy
+IGZvciBtb3VudGluZy4KCiAgICAgICAgICAgICAgICAgMilMT1dFU1RfVVNFUl9JRAogICAgICAg
+ICAgICAgICAgICAgTG93ZXN0IHVzZXIgdWlkIGluIHN5c3RlbSwgdXN1YWxseSAxMDAwLgoKICAg
+ICAgICAgICAgICAgICAzKVVTRVJfTE9PUERFVl9NQVgKICAgICAgICAgICAgICAgICAgIEV2ZXJ5
+IHVzZXIgY2FuIG1vdW50IGF0IGxlYXN0IFVTRVJfTE9PUERFVl9NQVggaW1hZ2VzCgogICAgICAg
+ICAgICAgICAgIEV4YW1wbGU6CiAgICAgICAgICAgICAgICAgICB5bW91bnQgc2V0dGluZ3MKCiAg
+ICAgICAgd2hlcmUgT1BFUkFUSU9OID0geyBpbmZvIH0KIgp9CgojIElOUFVUIFBBUkFNRVRFUlMg
+PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09
+PT09PT09PT09CgpwYXRoX3RvX2ltZ19maWxlPSIiCm9wZXJhdGlvbj0ibW91bnQiCnNraXBfb3B0
+X21vdW50PSJuIgptb3VudF9wb2ludF9pZD0iIgpydW5hc3VzZXI9IiIKYWxseV9hdXRvX21vZGU9
+IiIKY2hlY2tfaW1nX2RpcnM9Im4iCnVubW91bnRfYWxsPSJuIgojbm9fbWFpbl9jYWxsPSJuIgoK
+Zm9yIGFyZyBpbiAiJEAiOyBkbwogIGNhc2UgIiRhcmciIGluIAogICAgaGVscHxcP3wtLWhlbHB8
+LWgpCiAgICAgIGhlbHBfZGVzYwogICAgICBleGl0IDA7CiAgICA7OwoKICAgIG1vdW50fG1vdW50
+PSp8LS1tb3VudHwtLW1vdW50PSp8LW09KikKICAgICAgb3BlcmF0aW9uPSJtb3VudCIKICAgICAg
+cGF0aF90b19pbWdfZmlsZT0iJHthcmcjKj19IgogICAgOzsKICAgIC0tbm8tb3B0LW1vdW50fC0t
+bm8tb3B0fC1uKQogICAgICBza2lwX29wdF9tb3VudD0ieSIKICAgIDs7CiAgICAtLWNoZWNrLWlt
+Zy1kaXJzfC1jKQogICAgICBjaGVja19pbWdfZGlycz0ieSIKICAgIDs7CiAgICAtLW1vdW50LXBv
+aW50LWlkPSp8LWk9KikKICAgICAgbW91bnRfcG9pbnRfaWQ9IiR7YXJnIyo9fSIKICAgIDs7Cgog
+ICAgdW5tb3VudHx1bW91bnR8LS11bm1vdW50fC0tdW1vdW50ICkKICAgICAgb3BlcmF0aW9uPSJ1
+bW91bnQiIAogICAgOzsKICAgIC0tdXNlcj0qKQogICAgICBydW5hc3VzZXI9IiR7YXJnIyo9fSIK
+ICAgICAgYWxseV9hdXRvX21vZGU9InkiCiAgICA7OwoKICAgIC0tdW5tb3VudC1hbGx8LS11bW91
+bnQtYWxsfC1hKQogICAgICB1bm1vdW50X2FsbD0ieSIKICAgIDs7CgogICAgc2V0dGluZ3MpCiAg
+ICAgICAgZWNobyAiTE9PUERFVl9TVEFSVF9PRkZTRVQ9JExPT1BERVZfU1RBUlRfT0ZGU0VUIgog
+ICAgICAgIGVjaG8gIlVTRVJfTE9PUERFVl9NQVg9JFVTRVJfTE9PUERFVl9NQVgiCiAgICAgICAg
+ZWNobyAiTE9XRVNUX1VTRVJfSUQ9JExPV0VTVF9VU0VSX0lEIgogICAgICAgICNleHBvcnQgTE9P
+UERFVl9TVEFSVF9PRkZTRVQKICAgICAgICBvcGVyYXRpb249InNldHRpbmdzIgogICAgICAgICNu
+b19tYWluX2NhbGw9InkiCiAgICAgICAgZXhpdCAwOwogICAgOzsKICAgIGluZm8pCiAgICAgICAg
+I2V4cG9ydCBMT09QREVWX1NUQVJUX09GRlNFVAogICAgICAgIG9wZXJhdGlvbj0iaW5mbyIKICAg
+IDs7CgogIGVzYWMKZG9uZQoKIyBJTlBVVCBQQVJBTUVURVJTID09PT09PT09PT09PT09PT09PT09
+PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PQoKI0RFUEVOREVO
+Q0lFU19MSVNUPSggImdyZXAgLS1oZWxwIDAiICJlZ3JlcCAtLWhlbHAgMCIgImF3ayAtLWhlbHAg
+MCIgIm1rZGlyIC0taGVscCAwIiAiY2htb2QgLS1oZWxwIDAiIFwKIyAgICAgICAgICAgICAgICAg
+ICAgImNob3duIC0taGVscCAwIiAibG9zZXR1cCAtLWhlbHAgMCIgImtwYXJ0eCAtLWhlbHAgMSIg
+Im1vdW50IC0taGVscCAwIiAiaWQgLS1oZWxwIDAiIFwKIyAgICAgICAgICAgICAgICAgICAgInNt
+YnN0YXR1cyAtLWhlbHAgMSIgInNtYmNvbnRyb2wgLS1oZWxwIDEiICJsc29mIC1oIDAiICkKI2Rl
+cGVuZGVuY2llc190ZXN0CiNyZXQ9JD8KI1sgIiR7cmV0fSIgIT0gIjAiIF0gJiYgZXhpdCAxCgpp
+ZiBbICIkcnVuYXN1c2VyIiA9PSAiIiBdOyB0aGVuCiAgaWYgWyAkKGlkIC11KSA9PSAwIF07IHRo
+ZW4KICAgIGVjaG8gIiBFcnJvcjogUGxlYXNlIHJ1biB0aGlzIGNvbW1hbmQgdW5kZXIgbm9ybWFs
+IHVzZXIiCiAgICBlY2hvICIiCiAgICBleGl0IDEKICBlbHNlCiAgICBsb2dnZWRfdXNlcl9pZF89
+JChpZCAtdSkKICAgIGxvZ2dlZF91c2VyX25hbWVfPSQoaWQgLXVuKQogIGZpCmVsc2UKCiAgI1RP
+RE86SWYgd2UgZG8gbm90IGhhdmUgdGhpcyB3ZSBhbGxvdyBhbnkgdXNlciBydW4gc3ltb3VudCBh
+cyByb290Pndyb25nLCB3ZSBoYXZlIHRvIGtpY2sgb3V0IHVzZXIgZnJvbSBoZXJlCiAgaWYgWyAk
+KGlkIC11KSAhPSAwIF07IHRoZW4KICAgIGVjaG8gIiBFcnJvcjogUGxlYXNlIHJ1biB0aGlzIGNv
+bW1hbmQgYXMgcm9vdCIKICAgIGVjaG8gIiIKICAgIGV4aXQgMQogIGZpCgogIGxvZ2dlZF91c2Vy
+X2lkXz0kKGlkIC11ICIkcnVuYXN1c2VyIikKICBsb2dnZWRfdXNlcl9uYW1lXz0kKGlkIC11biAi
+JHJ1bmFzdXNlciIpCiAgX3JldD0kPwogIGlmIFsgIiRfcmV0IiAhPSAiMCIgXTsgdGhlbgogICAg
+ZWNobyAiIEVycm9yOiBVc2VyIG5vdCBmb3VuZCIKICAgIGV4aXQgMQogIGZpCgpmaQoKCmlmIFsg
+IiR7b3BlcmF0aW9ufSIgPT0gInVtb3VudCIgXSAmJiBbICIke3VubW91bnRfYWxsfSIgPT0gInki
+IF07IHRoZW4KCiB1bm1vdW50X2FsbD0ibiIKIGZvciAoKF9rPTA7IF9rPCIke1VTRVJfTE9PUERF
+Vl9NQVh9IjtfaysrICkpOyBkbwogICBtb3VudF9wb2ludF9pZD0iJHtfa30iCiAgIHN1ZG8gL3Vz
+ci9sb2NhbC9iaW4vc3ltb3VudCAiJHtMT09QREVWX1NUQVJUX09GRlNFVH0iICIke0xPV0VTVF9V
+U0VSX0lEfSIgIiR7VVNFUl9MT09QREVWX01BWH0iICIke0lNQUdFX0RJUn0iIFwKICAgICAgICAg
+ICAgICAgICAgICAgICAgICAgICAiJHtvcGVyYXRpb259IiAiJHtwYXRoX3RvX2ltZ19maWxlfSIg
+IiR7c2tpcF9vcHRfbW91bnR9IiAiJHtjaGVja19pbWdfZGlyc30iICIke21vdW50X3BvaW50X2lk
+fSJcCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICIke3J1bmFzdXNlcn0iICIke2FsbHlf
+YXV0b19tb2RlfSIgIiR7bG9nZ2VkX3VzZXJfaWRffSIgIiR7bG9nZ2VkX3VzZXJfbmFtZV99IgoK
+ICAgX3JldD0iJD8iCiAgIGlmIFsgIiR7X3JldH0iICE9ICIwIiBdOyB0aGVuCiAgICAgZWNobyAi
+RXJyb3I6IFVubW91bnQgYWxsLiBFeGl0aW5nICIKICAgICBleGl0ICIke19yZXR9IgogICBmaQog
+ZG9uZQoKIGV4aXQgMApmaQoKCiNpZiBbICIke25vX21haW5fY2FsbH0iID09ICJuIiBdOyB0aGVu
+CiAgI21haW5iYXNoCnN1ZG8gL3Vzci9sb2NhbC9iaW4vc3ltb3VudCAiJHtMT09QREVWX1NUQVJU
+X09GRlNFVH0iICIke0xPV0VTVF9VU0VSX0lEfSIgIiR7VVNFUl9MT09QREVWX01BWH0iICIke0lN
+QUdFX0RJUn0iXAogICAgICAgICAgICAgICAgICAgICAgICAgICAgIiR7b3BlcmF0aW9ufSIgIiR7
+cGF0aF90b19pbWdfZmlsZX0iICIke3NraXBfb3B0X21vdW50fSIgIiR7Y2hlY2tfaW1nX2RpcnN9
+IiAiJHttb3VudF9wb2ludF9pZH0iXAogICAgICAgICAgICAgICAgICAgICAgICAgICAgIiR7cnVu
+YXN1c2VyfSIgIiR7YWxseV9hdXRvX21vZGV9IiAiJHtsb2dnZWRfdXNlcl9pZF99IiAiJHtsb2dn
+ZWRfdXNlcl9uYW1lX30iCl9yZXQ9JD8KZXhpdCAke19yZXR9CiNmaQ==
+
+/usr/local/bin/symount
+IyEvYmluL2Jhc2gKIz09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09
+PT09PT09PT09PT09PT09PT09PT09PT09CiMgTkFNRSAgICAgIDogICB5bW91bnQKIyBBVVRIT1Ig
+ICAgOiAgIEFuZHJ5cyBKaXJpCiMgREFURSAgICAgIDogICAyMDE3LjExLjA4CiMgVkVSU0lPTiAg
+IDogICAwLjIuNQojCiMgREVQRU5ERU5DSUVTOgojICAgICAgICAgICAgICAgMSkgYmluYXJpZXM6
+IGJhc2gsIGdyZXAsIGVncmVwLCBhd2ssIG1rZGlyLCBjaG1vZCwgY2hvd24sIAojICAgICAgICAg
+ICAgICAgICAgbG9zZXR1cCwga3BhcnR4LCBtb3VudCwgaWQsIHNtYnN0YXR1cywgc21iY29udHJv
+bAojCiMgICAgICAgICAgICAgICAyKSBQYXRoIHRvIFlvY3RvIGltYWdlIGhhdmUgdG8gaW5jbHVk
+ZSB1c2VybmFtZVt4eHh4eHhdIAojICAgICAgICAgICAgICAgICAgYW5kIGltYWdlIG11c3QgaGF2
+ZSBleHRlbnRpb24gKi5xZW11cmF3aW1nLgojCiMgREVTQ1JJUFRJT046CiMgICAgICAgICAgICAg
+U2NyaXB0IGZvciBtb3VudGluZyByYXcgaW1hZ2VzIHdpdGggbXVsdGktdXNlciBzdXBwb3J0Lgoj
+ICAgICAgICAgICAgIFdpdGhvdXQgcGFyYW1ldGVycywgc2NyaXB0IHdpbGwgbW91bnQuCiMKIwoj
+CU51bWJlciBvZiBsb29wIGRldmljZSBpcyBnaXZlbiBieSB1aWQ6CiMJID5maXJzdF9sb29wZGV2
+X251bT0odWlkLTEwMDApKjMKIwojCUV2ZXJ5IHVzZXIgaGF2ZSBtYXggMyBsb29wIGRldmljZXM6
+CiMJID51aWQ9MTAwMDtmaXJzdF9sb29wZGV2X251bT0wO3swLDEsMn07CiMJID51aWQ9MTAwMTtm
+aXJzdF9sb29wZGV2X251bT0zO3szLDQsNX07CiMJID51aWQ9MTAwMjtmaXJzdF9sb29wZGV2X251
+bT02O3s2LDcsOH07CiMKIwlJbiBvcmRlciB0byBhY2Nlc3MgbWFjaGluZSBtb3VudHMgZWFzaWx5
+IGJ5IG9uZSBjaWZzIGNvbm5lY3Rpb24gCiMgICBhbmQgYmVpbmcgYWJsZSB0byB3b3JrIG9uIG11
+bHRpcGxlIGltYWdlcyBhdCBzYW1lIHRpbWUgd2l0aCBsZXNzIHBvc3NpYmxlIGNvbmZpZ3VyYXRp
+b24sCiMgICB0aGVuIGV2ZXJ5IFlvY3RvIGltYWdlIGlzIGF0IGZpcnN0IG1vdW50ZWQgdG8gIi9t
+bnQvJHt1c2VyfS92ZFgiIAojCWFuZCB0aGVuIHRoYXQgdG8gIi9vcHQvJHt1c2VyfS93b3JrcyIK
+IwojCUZvbGxvd2luZyBmb2xkZXJzIGhhdmUgdG8gZXhpc3RzIGluIEJ1aWxkTWFjaGluZToKIwk+
+Ii9tbnQvJHt1c2VyfS92ZDAiLCAiL21udC8ke3VzZXJ9L3ZkMSIsICIvbW50LyR7dXNlcn0vdmQy
+IgojCT4iL29wdC8ke3VzZXJ9L3dvcmtzIgojCiMJRm9sbG93aW5nIGZvbGRlcnMgaGF2ZSB0byBl
+eGlzdHMgaW4gaW1hZ2UgZHVlIHRvIHNlY29uZGFyeSBtb3VudDoKIwk+Ii9vcHQvJHt1c2VyfS93
+b3JrcyIKIwojCVRlc3RlZCBvbiBmb2xsb3dpbmcgRXZpcm9ubWVudHM6CiMJPlVidW50dSAxMi4w
+NCBMVFMsIDE0LjA0IExUUwojCT5VYnVudHUgMTYuMDQgTFRTCiMKIwlWZXJzaW9uIDAuMi4xIDoK
+Iwk+QWRkZWQgZnVuY3Rpb24gZm9yIGRldGVjdGlvbiBvZiBsb2NrZWQgZmlsZXMgYnkgc2FtYmEg
+YW5kIHNhbWJhIHNlc3Npb24ga2lsbGluZyAKIwk+QWRkZWQgZnVuY3Rpb24gZm9yIGRldGVjdGlv
+biBvZiBsb2NhbCB1c2VkIGZpbGVzIGFuZCBvZmZlciB0byB1c2VyIHRvIGtpbGwgdGhlbQojCT5B
+ZGRlZCBtaXNzaW5nIGRlcGVuZGVuY2llcyAKIwojCVZlcnNpb24gMC4yLjIgOgojICAgPjEuIFNt
+YWxsIGNoYW5nZXMgaW4gY29tbWVudHMgYW5kIHNvdXJjZSBjb2RlIAojICAgPjIuIEFkZGVkIHNj
+cmlwdCBwYXJhbWV0ZXJzOgojICAgPiJtb3VudHxtb3VudD0qfC0tbW91bnQ9KnwtbT0qIiAKIyAg
+ICAgLT4gV2hlbiBhZGRlZCwgc2NyaXB0IHdpbGwgbW91bnQgaW1hZ2UsIHBhcmFtZXRlciB2YWx1
+ZSBpbmNsdWRlcyBwYXRoIHRvIGltYWdlIGZpbGUuIAojICAgICAgICBJbiBjYXNlIG9mIG1pc3Np
+bmcgcGFyYW1ldGVyIHZhbHVlLCBzY3JpcHQgd2lsbCBhc2sgZm9yIHBhdGggdG8gaW1hZ2UgZmls
+ZS4KIwojICAgPiItLW5vLW9wdC1tb3VudHwtLW5vLW9wdHwtbiIgCiMgICAgIC0+IFdoZW4gYWRk
+ZWQsIHNjcmlwdCB3aWxsIHNraXAgc2Vjb25kIG1vdW50aW5nIHBvaW50IHRvIC9vcHQvJFVTRVIv
+d29ya3MuCiMgICAgICAgIFBhcmFtZXRlciBpcyBhcHBsaWVkIG9ubHkgaW4gY2FzZSBvZiBtb3Vu
+dGluZy4KIwojICAgPiItLW1vdW50LXBvaW50LWlkPSp8LWk9KiIKIyAgICAgICBXaGVuIGFkZGVk
+LCBhbmQgaWYgL21udC8kVVNFUi92ZCR7TU9VTlRfUE9JTlRfSURfTlVNQkVSfSBpcyBmcmVlIHRo
+ZW4gdHJ5IHRvIG1vdW50IGltYWdlIHRvIHRoaXMgcG9pbnQuCiMKIwlWZXJzaW9uIDAuMi4zIDoK
+IyAgIEJ1ZyBpbiBjYXNlIG9mIHVidW50dSAxNi4wNDogVW5hYmxlIHRvIGRldGVjdCBhbHJlYWR5
+IG1vdW50ZWQgL29wdC8kVVNFUi93b3Jrcy4KIyAgIE1pbm9yaXR5IGNoYW5nZXMgaW4gdXNlciBw
+cm9tcHRzLgojCiMgICBWZXJzaW9uIDAuMi40IDoKIyAgID4xKXByZXBhcmVfZGlyc19pbl9pbWFn
+ZSgpOkFkZCBzdXBwb3J0IGZvciBtdWx0aXBsZSBtb3VudGVkIGltYWdlcyBpbiBjYXNlIHRoYXQg
+Y3VycmVudCBpbWFnZSBkbyBub3QgaGF2ZSB5b2N0byBmb2xkZXJzCiMgICA+MilBZGRlZCBzY3Jp
+cHQgcGFyYW1ldGVycyBmb3IgZG9ja2VyIHNlcnZpY2VzIGFuZCBhbHNvIGFibGUgdG8gbW91bnQg
+Zm9yIGFueSB1c2VyIGFzIHJvb3Qgd2l0aCBoZWxwIG9mIC0tdXNlciBwYXJhbWV0ZXI6CiMgICA+
+Ii0tdXNlcj0qIiAKIyAgICAgICAtPndoZW4gYWRkZWQgc2NyaXB0IHN1cHBvc2UgdGhhdCBpbnRl
+cmFjdGl2ZSB1c2VyIGlucHV0IGlzIGRpc2FibGVkLCAKIyAgICAgICAgIHRoZXJlZm9yZSBhbGwg
+cGFyYW1ldGVycyBoYXZlIHRvIGJlIGZpbGVkIGFzIGlucHV0IHBhcmFtZXRlcnMgb2Ygc2NyaXB0
+CiMKIyAgID4iLS1tb3VudC1wb2ludC1pZD0qfC1pPSoiCiMgICAgICAgLT51c2VkIGFsc28gaW4g
+Y2FzZSBvZiB1bm1vdW50IAojICAgPjMpU3BlZWQtdXAgbW91bnQgcHJvY2VzcyBpbnN0ZWFkIG9m
+IHNsZWVwIGFkZCBjaGVjayBsb29wcyB3YWl0Zm9ybG9vcGRldigpLCB3YWl0Zm9yZmlsZSgpCiMK
+IyAgIFZlcnNpb24gMC4yLjUgOgojICAgPjEpYWRkIHN1cHBvcnQgZm9yIC0tY2hlY2staW1nLWRp
+cnMgaW4gY2FzZSBvZiAtbiBvcHRpb24gZm9yIHlvY3RvIHRvb2xzIGFuZCAtbiBvcHRpb24KIyAg
+ID4yKWFkZCBzdXBwb3J0IGZvciAtLXVubW91bnQtYWxsCiMgICA+MylhZGQgbmV3IG9wZXJhdGlv
+biA+IHNldHRpbmdzLAojICAgICAgICAgICAgICAgICAgICAgICAgICBwcmludCBvbmx5IHNldHRp
+bmdzIGFuZCBleHBvcnQgdG8gZW52IExPT1BERVZfU1RBUlRfT0ZGU0VULCBMT1dFU1RfVVNFUl9J
+RCwgVVNFUl9MT09QREVWX01BWAojICAgICAgICAgICAgICAgICAgICAgICAgICB1c2VmdWxsIGZv
+ciBvdGhlciB0b29scyB5Y2ltZyBhbmQgeW9jdG8KIyAgID40KWFkZCBuZXcgb3BlcmF0aW9uID4g
+aW5mbywKIyAgICAgICAgICAgICAgICAgICAgICAgICAgcHJpbnQgbW91bnRlZCBkZXZpY2VzIGZv
+ciBnaXZlbiB1c2VyCiMgIFZlcnNpb24gMC4yLjYgOgojICA+dGVzdGluZyBzdWlkIC4uLgojPT09
+PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09
+PT09PT09PT0KI0xPT1BERVZfU1RBUlRfT0ZGU0VUPTUKI0xPV0VTVF9VU0VSX0lEPTEwMDAKI1VT
+RVJfTE9PUERFVl9NQVg9MwojSU1BR0VfRElSPSIvbW50L25hc19yYWlkMTAiCiM9PT09PT09PT09
+PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PQoKI1JldHVybiBh
+cnJheSBvZiBtb3VudCBwb2ludHMgaW4gdW5tb3VudCBvcmRlcgojICQgZ2V0X3Vtb3VudHMgJy9t
+bnQvJFVTRVIvdmQyLycgInVtb3VudF9hcnIiCiMgJCBlY2hvICIke3Vtb3VudF9hcnJbQF19Igoj
+CiNkdWUgdG8gZG9ja2VyIGlzc3VlIGFuZCBtb3VudGVkIGZpbGVzIGFmdGVyIHNlcnZpY2Ugc2h1
+dGRvd24KIyAkY2F0IC9wcm9jL21vdW50cwojL2Rldi9tYXBwZXIvbG9vcDJwMSAvbW50L2FsanAy
+MTAwNTkyL3ZkMi9kb2NrZXIvYXVmcyBleHQ0IHJ3LHJlbGF0aW1lLGRhdGE9b3JkZXJlZCAwIDAK
+I25vbmUgL21udC8kVVNFUi92ZDIvZG9ja2VyL2F1ZnMvbW50LzQ2ZDU1Yjg3NGEwY2FjOGRmMDk3
+OWE5Yzc3MDZlMjVhNjMxODA0Y2ZhYTkzNjdjOGQyZDBhNWY0NDk0NjYzNjMgYXVmcyBydyxyZWxh
+dGltZSxzaT1kNGU2Mzg2YTIxNjdhMzIzLGRpbyxkaXJwZXJtMSAwIDAKI3NobSAvbW50LyRVU0VS
+L3ZkMi9kb2NrZXIvY29udGFpbmVycy8xMWRiOTE4M2UyYTU5MjRhNzMzYTU2ODlkMTJkZDk0NjYx
+NGQwNTIwNTRmOTg3MmUxMjU2ZjAwY2Y3ZWFlMjFhL3NobSB0bXBmcyBydyxub3N1aWQsbm9kZXYs
+bm9leGVjLHJlbGF0aW1lLHNpemU9NjU1MzZrIDAgMApnZXRfdW1vdW50cygpIHsKICBsb2NhbCBf
+bW50cm9vdD0iJDEiCiAgbG9jYWwgX3JldD0iJDIiCiAgZGVjbGFyZSAtYSBfcmV0X2FyciAKICBs
+b2NhbCBfbW50cz0oICQoY2F0IC9wcm9jL21vdW50cyB8IGF3ayAtdiBtbnRyb290PSIke19tbnRy
+b290fSIgJ3sKICAgbW50ZGV2aWNlPSQxO21udHBvaW50PSQyOwogICBmbmQ9bWF0Y2gobW50cG9p
+bnQsbW50cm9vdCIqIikKICAgaWYoZm5kPT0xKXsgcHJpbnQgbW50cG9pbnR9CiAgfScpICkKICAj
+aW52ZXJzZSBvcmRlciB0aGFuIG1vdW50IG9yZGVyIC4uLi5tb3VudCAxIDIgMzsgdW5tb3VudCAz
+IDIgMQogIGZvciAoKCBpPSIkeyNfbW50c1tAXX0iLTE7aT49MTsgaS0tICkpO2RvCiAgIF9yZXRf
+YXJyKz0oICIke19tbnRzWyRpXX0iICkKICBkb25lCiAgCiAgZXZhbCAiJHtfcmV0fSI9JygnJHtf
+cmV0X2FycltAXX0nKScKICAKICByZXR1cm4gMAogIAp9CgpkZXBlbmRlbmNpZXNfdGVzdCgpIHsK
+ICAjZm9ybWF0OiBhbGwgY29tbWFuZHMgaGVyZSBhcmUgaW4gZm9ybWF0ICJDTUROQU1FIFNPTUVf
+UEFSQU1FVEVSUyBSRVRVUk5fVkFMVUUiCgogICBmb3IgY21kIGluICIke0RFUEVOREVOQ0lFU19M
+SVNUW0BdfSI7IGRvIAogICAgIwogICAgc3ViX2NtZF9hcnI9KCAke2NtZH0gKQogICAgbHN0PSIk
+eyNzdWJfY21kX2FycltAXX0iCiAgICBzdWJfY21kPSIke3N1Yl9jbWRfYXJyW0BdOjA6bHN0LTF9
+IgogICAgY21kX29ubHk9JHtzdWJfY21kX2FyclswXX0KICAgIGV4cF9yZXR2YWw9IiR7c3ViX2Nt
+ZF9hcnJbQF06IC0xfSIKICAgICMKICAgIHJldHZhbD0kKCAke3N1Yl9jbWR9ICY+L2Rldi9udWxs
+KQogICAgcmV0dmFsPSQ/CiAgICBpZiBbICIke3JldHZhbH0iICE9ICIke2V4cF9yZXR2YWx9IiBd
+ICYmIFsgIiR7cmV0dmFsfSIgIT0gIjAiIF07IHRoZW4KICAgICAgZWNobyAtZSAiICBFcnJvcjog
+RGVwZW5kZW5jaWVzIHRlc3QgZmFpbCAhIgogICAgICBlY2hvIC1lICcgICAgICAgICAiJyRzdWJf
+Y21kJyIgY29tbWFuZCBzaG91bGQgcmV0dXJuIDAgb3IgIickZXhwX3JldHZhbCciJyJcbiAgICAg
+ICAgIGJ1dCByZXR1cm5lZCB2YWx1ZSBpcyAiJyInJHJldHZhbCciIScgCiAgICAgIHJldHVybiAx
+CiAgICBmaQogICBkb25lCgogIHJldHVybiAwCn0KCndhaXRmb3Jsb29wZGV2KCkgewogIGxvY2Fs
+IF9sb29wZGV2X251bT0iJDEiCiAgbG9jYWwgX2ltZ19maWxlPSIkMiIKCiAgbG9jYWwgX2lzbG9h
+ZGVkPSIiCiAgd2hpbGUgWyAiJF9pc2xvYWRlZCIgPT0gIiIgXTsgZG8KICAgIHNsZWVwIDAuMgog
+ICAgX2lzbG9hZGVkPSQoc3VkbyBsb3NldHVwIC1hIHwgZWdyZXAgImRldi4qbG9vcCR7X2xvb3Bk
+ZXZfbnVtfTouKiR7X2ltZ19maWxlfSIpIAogIGRvbmUKfQoKd2FpdGZvcmZpbGUoKSB7CiAgbG9j
+YWwgX2ZpbGU9IiQxIgoKICB3aGlsZSBbICEgLWUgIiRfZmlsZSIgXTsgZG8KICAgIHNsZWVwIDAu
+MgogIGRvbmUKfQoKCiMgICBAcGFyYW0gIDogICBbaW5wdXRdICAgOiAgICAkMSAgOiBwYXRoICB3
+aGVyZSB3ZSB3YW5uYSBzZWFyY2ggCiMgICBAcmV0ICAgIDogICAgICAgICAgICAgICAgICAgICAg
+OmlmIFsgJD8gPT0gMCBdICAtPiBOb3RoaW5nIGlzIGxvY2tlZAojICAgICAgICAgICAgICAgICAg
+ICAgICAgICAgICAgICAgIDppZiBbICQ/ID09IDEgXSAgLT4gU29tZSBmaWxlcyBhcmUgbG9ja2Vk
+CiMgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgOmlmIFsgJD8gPiAxMDAwXSAtPiBV
+c2VyIGRlY2lkZSB0byBraWxsIHByb2Nlc3NlcwojICAgICAgICAgICAgICAgICAgICAgICAgICAg
+ICAgICAgICAgICAgICAgICAgICAgICAgICAgaWYgdmFsdWUgPiAxMDAwIHRoZW4gc29tZSBwcm9n
+cmFtIHdhcyBub3QgcHJvcGVybHkgdGVybWluYXRlZApmaW5kb2YoKSB7CiBsb2NhbCBiYXNlcGF0
+aF89JDEKIGxvY2FsIHBpZF8KIGRlY2xhcmUgLWEgcGlkc2FsbAoKICNQSUQsQ09NTUFORF9OQU1F
+LEZJTEVOQU1FCiB1b2Y9KCAkKGxzb2YgLWwgLWEgLXUiJHtsb2dnZWRfdXNlcl9pZF99IiAtLSAi
+JHtiYXNlcGF0aF99IiAgMj4vZGV2L251bGwgfCBhd2sgJ0ZOUj4xe3ByaW50ICQyIiwiJDEiLCIk
+OX0nKSApCiBpZiBbIC16ICIke3VvZn0iIF07IHRoZW4KICAgcmV0dXJuIDA7CiBlbHNlCiAgZm9y
+IG9mIGluICIke3VvZltAXX0iOyBkbwogICAgcGlkc2FsbCs9KCIke29mJSUsKn0iKQogIGRvbmUK
+ICBlY2hvIC1lICJcbiBGb2xsb3dpbmcgZmlsZXMgYXJlIHVzZWQgYnkgeW91OiIKICBlY2hvICIg
+ICAiIlBJRCwgQ09NTUFORCwgRklMRSIKICBmb3IgdG1wIGluICIke3VvZltAXX0iOyBkbwogICBl
+Y2hvICIgICAiIiR0bXAiCiAgZG9uZQogZmkKCiBlY2hvIC1lICJcbiBBbGwgeW91ciBwcm9ncmFt
+cyB3aWxsIGJlIHRlcm1pbmF0ZWQhIgogZWNobyAtZSAiID5EbyB5b3UgcmVhbGx5IHdhbnQgdG8g
+dGVybWluYXRlICE/IFt5L25dIgogCiBpZiBbICIkYWxseV9hdXRvX21vZGUiICE9ICJ5IiBdOyB0
+aGVuCiAgIHJlYWQgLXAgIiA+IiByZXNwCiBlbHNlCiAgIHJlc3A9InkiCiBmaQogCiBpZiBbICIk
+cmVzcCIgPT0gInkiIF07dGhlbgogICByZXRzdW09NTAKICAgZm9yIHBpZF8gaW4gIiR7cGlkc2Fs
+bFtAXX0iOyBkbwogICAgIHN1ZG8ga2lsbCAtcyBLSUxMICIke3BpZF99IgogICAgIHJldF89JD8K
+ICAgICAoKHJldHN1bT0kcmV0c3VtICsgJHJldF8pKQogICBkb25lCiAgIHJldHVybiAiJHtyZXRz
+dW19IgogZmkKCn0KCgojRmluZCBsb2NrZWQgZmlsZXMgYnkgc2FtYmEgYW5kIHByb21wdCB1c2Vy
+IGluIHRoaXMgY2FzZSBhbmQgb2ZmZXIgdGVybWluYXRpb24gb2YgcmVsYXRlZCBzYW1iYSBkYWVt
+b24gOgojICAgQHBhcmFtICA6ICAgW2lucHV0XSAgIDogICAgJDEgIDogcGF0aCB0byBtb3VudGVk
+IHNhbWJhIAojICAgQHJldCAgICA6ICAgICAgICAgICAgICAgICAgICAgIDppZiBbICQ/ID09IDAg
+XSAgLT4gTm90aGluZyBpcyBsb2NrZWQKIwkJCQkgICA6aWYgWyAkPyA9PSAxIF0gIC0+IFNvbWUg
+ZmlsZXMgYXJlIGxvY2tlZAojICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIDppZiBb
+ICQ/ID4gMTAwMF0gLT4gVXNlciBkZWNpZGUgdG8ga2lsbCBoaXMgc2hhcmVzLCBzbwojCQkJCQkJ
+ICAgICAgIGlmIHZhbHVlID4gMTAwMCB0aGVuIHNvbWUgcHJvZ3JhbSB3YXMgbm90IHByb3Blcmx5
+IHRlcm1pbmF0ZWQKZmluZF9zbWJfb2YoKSB7CiBtbnRwdGhfPSQxCiByZXR2YWw9MAogZGVjbGFy
+ZSAtYSBzcGlkc18KIGRlY2xhcmUgLWEgbGZpbGVzXwoKIGxvY2FsIGlzX3NtYmRfcnVubmluZ189
+JChwcyAtYXV4IHwgZ3JlcCBzbWJkIHwgZ3JlcCAtdiBncmVwKQogaWYgWyAteiAiJHtpc19zbWJk
+X3J1bm5pbmdffSIgXTsgdGhlbgogICByZXR1cm4gMDsKIGZpCgogI3VzZXIgaWRlbnRpZmljYXRp
+b24gd2l0IHBhcmFtZXRlciAtdSJVU0VSIiBkb2VzIG5vdCB3b3JrIGluIHRoaXMgIHZlcnNpb24g
+d2UgaGF2ZSB0byBmaWx0ZXIgaXQgbWFudWFsbHkgYnkgZ3JlcCAKIGxvY2FsIGxja3NfPSggJChz
+dWRvIHNtYnN0YXR1cyAtbiAtTCB8IGF3ayAtdiB1c3I9IiRsb2dnZWRfdXNlcl9pZF8iICdGTlI+
+M3tpZigkMj09dXNyKXsgcHJpbnQgJDEiLCIkNyIvIiQ4IH19JyB8IGdyZXAgIiR7bW50cHRoX30i
+IHwgZ3JlcCAtdiBncmVwICkgKQoKIGZvciBsY2sgaW4gIiR7bGNrc19bQF19IjsgZG8KICBsb2Nh
+bCBzcGlkXz0iJHtsY2slJSwqfSIKICBzcGlkc18rPSgiJHNwaWRfIikKICBsb2NhbCBsZmlsZV89
+IiR7bGNrOiR7I3NwaWRffSsxfSIKICBsZmlsZXNfKz0oIiRsZmlsZV8iKQogICNlY2hvICJQSUQg
+IDogIiIkc3BpZF8iIjsgIEZpbGUgOiAiJyInJGxmaWxlXyciJwogZG9uZQoKIGxvY2FsIGlwc189
+KCAkKHN1ZG8gc21ic3RhdHVzIC1uIC1iIHwgYXdrIC12IHVzcj0iJGxvZ2dlZF91c2VyX2lkXyIg
+LXYgc3BpZD0iJHNwaWRfIiAnRk5SPjN7aWYoJDI9PXVzciAmJiAkMT09c3BpZCl7IHByaW50ICQ0
+IH19JyB8IGdyZXAgLXYgZ3JlcCApICkKCiBpZiBbICEgIiR7I2xmaWxlc19bQF19IiAtZXEgMCBd
+OyB0aGVuCiAgZWNobyAtZSAiXG4gRm9sbG93aW5nIGZpbGVzIGFyZSBsb2NrZWQgYnkgeW91OiIK
+ICBlY2hvICIgIiIke2xmaWxlc19bQF19IgogIHJldHZhbD0xCiBlbHNlIAogIHJldHVybiAwCiBm
+aQoKIGVjaG8gLWUgIlxuIEFsbCB5b3VyIHNoYXJlcyBjb25uZWN0ZWQgdG8gdGhpcyBhZGRyZXNz
+KCAiJyInJHtpcHNfW0BdfSciJyIgKSB3aWxsIGJlIHRlcm1pbmF0ZWQhIgogZWNobyAtZSAiID5E
+byB5b3UgcmVhbGx5IHdhbnQgdG8gdGVybWluYXRlICE/IFt5L25dIgogCiBpZiBbICIkYWxseV9h
+dXRvX21vZGUiICE9ICJ5IiBdOyB0aGVuCiAgIHJlYWQgLXAgIiA+IiByZXNwCiBlbHNlCiAgIHJl
+c3A9InkiCiBmaQoKIGlmIFsgIiRyZXNwIiA9PSAieSIgXTsgdGhlbgogICBlY2hvICIgUmVzdGFy
+dGluZyB5b3VyIHNoYXJlcyAhIgogICByZXR2YWw9MTAwMAogICBmb3IgaXAgaW4gIiR7aXBzX1tA
+XX0iOyBkbwogICAgIHN1ZG8gc21iY29udHJvbCBzbWJkIGtpbGwtY2xpZW50LWlwICIkaXAiCiAg
+ICAgcmV0Xz0kPwogICAgICgocmV0dmFsPSRyZXR2YWwgKyAkcmV0XyApKQogICBkb25lCiAgIHJl
+dHVybiAiJHtyZXR2YWx9IgogZmkKCiByZXR1cm4gIiRyZXR2YWwiCgp9CgpwcmVwYXJlX2RpcnMo
+KSB7CiAgI0NyZWF0ZSBkaXJlY3RvcmllcyBpbiBzeXN0ZW0gWy9tbnQvJHVzZXIvdmQkbjsgL29w
+dC8kdXNlci93b3JrcyBdIGFuZCBzZXQgdXNlciByaWdodHMKICBlY2hvICIgQ2hhbmdpbmcgQUNM
+cyBmb3IgbG9vcGRldmljZXMgIDogL2Rldi9sb29wIgogIGVjaG8gIiAtIgogIGVjaG8gIiIKICBz
+dWRvIGNobW9kIDc3NyAvZGV2L2xvb3AqCiAgZWNobyAiIgoKICBmb3IgKChfaj0wOyBfajwiJHtV
+U0VSX0xPT1BERVZfTUFYfSI7X2orKyApKTsgZG8KICAgIGxvY2FsIF90bXA9Ii9tbnQvIiIke21u
+dF99IiIke19qfSIKICAgIGlmIFsgISAtZCAiJHtfdG1wfSIgXTt0aGVuCiAgICAgIGVjaG8gIiBD
+cmVhdGluZyBkaXJlY3RvcnkgIDogL21udC8qIiIke19qfSIKICAgICAgc3VkbyBta2RpciAtcCAi
+JHtfdG1wfSIKICAgICAgc3VkbyBjaG93biAtUiAiJHtsb2dnZWRfdXNlcl9uYW1lX30iOiIke2xv
+Z2dlZF91c2VyX25hbWVffSIgIi9tbnQvJHtsb2dnZWRfdXNlcl9uYW1lX30iCiAgICAgIHN1ZG8g
+Y2htb2QgNzcwICIvbW50LyIiJHtsb2dnZWRfdXNlcl9uYW1lX30iCiAgICBmaQogIGRvbmUKCiAg
+bG9jYWwgX3RtcD0iL29wdC8iIiR7b3B0X30iCiAgaWYgWyAhIC1kICIke190bXB9IiBdO3RoZW4K
+ICAgIGVjaG8gIiBDcmVhdGluZyBkaXJlY3Rvcnk6IC9vcHQvKiIKICAgIHN1ZG8gbWtkaXIgLXAg
+IiR7X3RtcH0iCiAgICAjc3VkbyBjaG93biAtUiAiJHtsb2dnZWRfdXNlcl9uYW1lX30iOiIke2xv
+Z2dlZF91c2VyX25hbWVffSIgIiR7X3RtcH0iCiAgICBzdWRvIGNob3duIC1SICIke2xvZ2dlZF91
+c2VyX25hbWVffSI6IiR7bG9nZ2VkX3VzZXJfbmFtZV99IiAiL29wdC8iIiR7bG9nZ2VkX3VzZXJf
+bmFtZV99IgogICAgc3VkbyBjaG1vZCA3NzAgLVIgIi9vcHQvIiIke2xvZ2dlZF91c2VyX25hbWVf
+fSIKICBmaQoKfQoKCiNSZXR1cm4gZmlyc3QgZnJlZSBsb29wZGV2aWNlIG51bWJlciBvZiBnaXZl
+biB1c2VyOgojICAgQHBhcmFtICA6IFtvdXRwdXRdICA6ICAgICAgICQxICAgICAgICAgICAgICAg
+ICAgICAgICAgICAgICAgbG9vcGRldl9udW1fCiMgICBAcmV0ICAgIDogICAgICAgICAgICAgICAg
+ICAgaWYgWyAkPyAhPSAwIF07IHRoZW4gLT4gZXJyb3IKZ2V0X2ZyZWVsb29wZGV2X251bSgpIHsK
+CiAgIy9kZXYvbWFwcGVyL2xvb3AxcDEgb24gL21udC9qaXJpL3Ztd2FyZTEKICAjbW91bnQgfCBl
+Z3JlcCAiZGV2LiptYXBwZXIuKmxvb3AuKiR7bG9nZ2VkX3VzZXJfbmFtZV99IgogICN0ZXN0PS9k
+ZXYvbWFwcGVyL2xvb3AxcDEKCiAgbG9jYWwgX2ZpcnN0X2xvb3BkZXZfbnVtPSQoKCAke0xPT1BE
+RVZfU1RBUlRfT0ZGU0VUfSArICgke1VTRVJfTE9PUERFVl9NQVh9ICogKCR7bG9nZ2VkX3VzZXJf
+aWRffSAtICR7TE9XRVNUX1VTRVJfSUR9KSkgKSkKCiAgZm9yICgoX2o9MDsgX2o8IiR7VVNFUl9M
+T09QREVWX01BWH0iO19qKysgKSk7IGRvCiAgICBsb2NhbCBfbG9vcGRldl9udW09JCgoJHtfZmly
+c3RfbG9vcGRldl9udW19KyR7X2p9KSkKICAgIGxvY2FsIF9pc3VzZWRieXN5c3RlbT1gbG9zZXR1
+cCAiL2Rldi9sb29wJHtfbG9vcGRldl9udW19IiAyPi9kZXYvbnVsbGAKICAgIGxvY2FsIF9pc3Vz
+ZWQ9YG1vdW50IHwgZWdyZXAgImRldi4qbWFwcGVyLipsb29wJHtfbG9vcGRldl9udW19cC4qJHts
+b2dnZWRfdXNlcl9uYW1lX30iYAogICAgaWYgWyAteiAiJHtfaXN1c2VkYnlzeXN0ZW19IiBdICYm
+IFsgLXogIiR7X2lzdXNlZH0iIF07dGhlbiAKICAgICAgbG9jYWwgX3JldD0kMTsKICAgICAgZXZh
+bCAkX3JldD0ke19sb29wZGV2X251bX07IAogICAgICByZXR1cm4gMDsgCiAgICBmaQogIGRvbmUK
+CiAgI0Vycm9yOiBhbnkgYXZhaWxhYmxlIGxvb3AgZGV2aWNlcyBmb3IgZ2l2ZW4gdXNlcgogIGxv
+Y2FsIF9yZXQ9IiQxIjsgZXZhbCAkX3JldD0iIjsgcmV0dXJuIDE7Cn0KCiNUZXN0IGlmIGdpdmVu
+IG1vdW50LXBvaW50LWlkIGlzIGZyZWUgYW5kIHJldHVybiByZWxhdGVkIGxvb3BkZXY6CiMgICBA
+cGFyYW0gIDogW2lucHV0XSAgIDogICAgICAgJDE9bW91bnQtcG9pbnQtaWQKIyAgIEBwYXJhbSAg
+OiBbb3V0cHV0XSAgOiAgICAgICAkMiByZXR1cm5lZCBsb29wIGRldmljZSBudW1iZXIKIyAgIEBy
+ZXQgICAgOiAgICAgICAgICAgICAgICAgIGlmIFsgJD8gIT0gMCBdOyB0aGVuIC0+IGVycm9yIC0+
+IGdpdmVuIG1vdW50LXBvaW50LWlkIGlzIE5PVCBmcmVlCmdldF9sb29wZGV2bnVtKCkgewogIGxv
+Y2FsIF9tbnRfcG9pbnRfaWQ9JDEKICBsb2NhbCBfcmV0PSQyCgogICMvZGV2L21hcHBlci9sb29w
+MXAxIG9uIC9tbnQvamlyaS92ZAogICNtb3VudCB8IGVncmVwICJkZXYuKm1hcHBlci4qbG9vcC4q
+JHtsb2dnZWRfdXNlcl9uYW1lX30iCiAgI3Rlc3Q9L2Rldi9tYXBwZXIvbG9vcDFwMQoKICAjbG9v
+cGRldj0kKCsoICR7VVNFUl9MT09QREVWX01BWH0gKiAoJHtsb2dnZWRfdXNlcl9pZF99IC0gJHtM
+T1dFU1RfVVNFUl9JRH0gKSkpCiAgbG9jYWwgX2xvb3BkZXZfbnVtPSQoKCAke19tbnRfcG9pbnRf
+aWR9ICsgJHtMT09QREVWX1NUQVJUX09GRlNFVH0gKyAoJHtVU0VSX0xPT1BERVZfTUFYfSAqICgk
+e2xvZ2dlZF91c2VyX2lkX30gLSAke0xPV0VTVF9VU0VSX0lEfSApKSAgICkpCiAgbG9jYWwgX2lz
+dXNlZGJ5c3lzdGVtPWBsb3NldHVwICIvZGV2L2xvb3Ake19sb29wZGV2X251bX0iIDI+L2Rldi9u
+dWxsYAogIGxvY2FsIF9pc3VzZWQ9YG1vdW50IHwgZWdyZXAgImRldi4qbWFwcGVyLipsb29wJHtf
+bG9vcGRldl9udW19cC4qJHtsb2dnZWRfdXNlcl9uYW1lX30iYAogIGlmIFsgLXogIiR7X2lzdXNl
+ZGJ5c3lzdGVtfSIgXSAmJiBbIC16ICIke19pc3VzZWR9IiBdOyB0aGVuIAogICAgI2xvY2FsIF9p
+c3VzZWQ9JChsb3NldHVwIC1hIDI+L2Rldi9udWxsIHwgYXdrICd7cHJpbnQgJDF9JyB8IGVncmVw
+ICJkZXYuKmxvb3Ake19sb29wZGV2X251bX06IikKICAgIGV2YWwgJF9yZXQ9JHtfbG9vcGRldl9u
+dW19OwogICAgcmV0dXJuIDA7IAogIGVsc2UKICAgIHJldHVybiAxOyAKICBmaQoKfQoKCgoKCiNS
+ZXR1cm4gdXNlZCBsb29wZGV2aWNlIG51bWJlcnMgb2YgZ2l2ZW4gdXNlcjoKIyAgIEBwYXJhbSAg
+OiAgIFtvdXRwdXRdICAgOiAgICAkMSAgOmFycmF5IG9mIHVzZWQgbG9vcGRldmljZXMgID5kZWNs
+YXJlIC1hIHVzZWRfbG9vcGRldgojICAgQHJldCAgICA6ICAgICAgICAgICAgICAgICAgICAgICA6
+aWYgWyAkPyAhPSAwIF0gLT4gRXJyb3IKZ2V0X3VzZWRsb29wZGV2X251bSgpIHsKCiAgIy9kZXYv
+bWFwcGVyL2xvb3AxcDEgb24gL21udC9qaXJpL3Ztd2FyZTEKICAjbW91bnQgfCBlZ3JlcCAiZGV2
+LiptYXBwZXIuKmxvb3AuKiR7bG9nZ2VkX3VzZXJfbmFtZV99IgogICN0ZXN0PS9kZXYvbWFwcGVy
+L2xvb3AxcDEKCiAgZGVjbGFyZSAtYSBfdG1wX2FycgogIGxvY2FsIF9pPTAKICBsb2NhbCBfZmly
+c3RfbG9vcGRldl9udW09JCgoICR7TE9PUERFVl9TVEFSVF9PRkZTRVR9ICsgKCR7VVNFUl9MT09Q
+REVWX01BWH0gKiAoJHtsb2dnZWRfdXNlcl9pZF99IC0gJHtMT1dFU1RfVVNFUl9JRH0gKSkgICAg
+KSkKICBsb2NhbCBfbGFzdF9sb29wZGV2X251bT0kKCggJHtfZmlyc3RfbG9vcGRldl9udW19ICsg
+JHtVU0VSX0xPT1BERVZfTUFYfSApKQoKICBmb3IgKChfaj0wOyBfajwiJHtVU0VSX0xPT1BERVZf
+TUFYfSI7X2orKyApKTtkbwogICAgbG9jYWwgX2xvb3BkZXZfbnVtPSQoKCR7X2ZpcnN0X2xvb3Bk
+ZXZfbnVtfSske19qfSkpCiAgICAjbG9jYWwgX2lzdXNlZD1gbG9zZXR1cCAtYSB8IGVncmVwICJk
+ZXYuKmxvb3Ake19sb29wZGV2X251bX0uKiR7bG9nZ2VkX3VzZXJfbmFtZV99ImAKICAgIGxvY2Fs
+IF9pc3VzZWRfbnVtPWBsb3NldHVwIC1hIDI+L2Rldi9udWxsIHwgZWdyZXAgImRldi4qbG9vcCR7
+X2xvb3BkZXZfbnVtfTouKnFlbXVyYXdpbWciIHwgYXdrICd7IHN0cl9sZW49bGVuZ3RoKCQxKTsg
+bnVtPXN1YnN0cigkMSwxMCxzdHJfbGVuLTEwKTsgcHJpbnQgbnVtIH0nYAogICAgaWYgWyAhIC16
+ICIke19pc3VzZWRfbnVtfSIgXTsgdGhlbgogICAgICAjIyhsb29wX251bSA8PSBtYXgpICYmIChs
+b29wX251bSA+PSBtaW4pCiAgICAgIGlmIFsgIiR7X2lzdXNlZF9udW19IiAtbGUgIiR7X2xhc3Rf
+bG9vcGRldl9udW19IiBdICYmIFsgIiR7X2lzdXNlZF9udW19IiAtZ2UgIiR7X2ZpcnN0X2xvb3Bk
+ZXZfbnVtfSIgXTsgdGhlbiAKICAgICAgICBfdG1wX2Fyclske19pfV09JHtfbG9vcGRldl9udW19
+OyBfaT0kKCggJF9pICsgMSApKTsKICAgICAgZmkKICAgIGZpCiAgZG9uZQoKICBlY2hvIAogIGxv
+Y2FsIF9yZXQ9IiQxIjsKICBldmFsICRfcmV0PScoJyR7X3RtcF9hcnJbQF19JyknOwogIAogIHJl
+dHVybiAwOwp9CgojQ2hlY2sgaWYgd2UgaGF2ZSBnb3Qgb3VyIGltYWdlCiMgVGhlIGltYWdlIGhh
+dmUgdG8gaGF2ZSBmb2xsb3dpbmcgIHBhdGg6IC9vcHQvJHVzZXIvd29ya3MgaWYgbm90IHN0b3Ag
+bW91bnRpbmcgIQojICAgQHBhcmFtICA6ICAgICAgICQxCQk6CXBhdGggdG8gaW1nICIvbW50LyIi
+JHttbnRffSIiJHtfdmRfbnVtfSIiL29wdC8iIiR7b3B0X30iCiMgICBAcmV0ICAgIDogICAgICAg
+MHwxCQk6CWltZyBvayA/CToJaWYgWyAkPyAhPSAwIF07IHRoZW4gLT4gZXJyb3IKY2hlY2tfaW1n
+b3duZXIoKSB7CiAgbG9jYWwgX3RtcD0iJDEiCiAgaWYgWyAtZCAiJHtfdG1wfSIgXTsgdGhlbgoJ
+I2RpcmVjdG9yeSBleGlzdCA+IE9rCglyZXR1cm4gMDsKICBlbHNlCQoJI2RpcmVjdG9yeSBub3Qg
+ZXhpc3QgPk5HID4gZXJyb3IKCXJldHVybiAxOwogIGZpCn0KCgojTW91bnQgcmF3IGltYWdlOgoj
+ICAgQHBhcmFtICA6ICAgICAgICAgICAkMSAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIGxv
+b3BkZXZfbnVtXwojICAgQHBhcmFtICA6ICAgICAgICAgICAkMiAgICAgICAgICAgICAgICAgICAg
+ICAgICAgICAgIHNraXBfb3B0X21vdW50CiMgICBAcGFyYW0gIDogICAgICAgICAgICQzICAgICAg
+ICAgICAgICAgICAgICAgICAgICAgICAgY2hlY2tfaW1nX2RpcnMoY2hlY2sgaWYgL29wdC9VU0VS
+L3dvcmtzIGV4aXN0ICkKIyAgIEBwYXJhbSAgOiAob3V0cHV0KSAgJDQgICAgICAgICAgICAgICAg
+ICAgICAgICAgICAgICBjdXJfbW91bnRlZAojICAgQHJldCAgICA6ICAgICAgIGlmIFsgJD8gIT0g
+MCBdOyB0aGVuIC0+IGVycm9yCm1vdW50X3Jhd2ltZygpIHsKICBsb2NhbCBfbG9vcGRldl9udW09
+JDEKICBsb2NhbCBfc2tpcF9vcHRfbW91bnQ9JDIKICBsb2NhbCBfY2hlY2tfaW1nX2RpcnM9JDMK
+ICBsb2NhbCBfcmV0PSQ0CiAgZGVjbGFyZSAtYSB0bXAKCiAgbG9jYWwgX2ZpcnN0X2xvb3BkZXZf
+bnVtPSQoKCAke0xPT1BERVZfU1RBUlRfT0ZGU0VUfSArICgke1VTRVJfTE9PUERFVl9NQVh9ICog
+KCR7bG9nZ2VkX3VzZXJfaWRffSAtICR7TE9XRVNUX1VTRVJfSUR9KSkgICApKQoKICAjMDEyLCAz
+NDUsdWlkPTEwMDEsZGV2bnVtPTQ7dmQ9MTsKICAjdmRfbnVtPV9sb29wZGV2X251bS1fZmlyc3Rf
+ZGV2X251bQogIGxvY2FsIF92ZF9udW09JCgoICR7X2xvb3BkZXZfbnVtfSAtICR7X2ZpcnN0X2xv
+b3BkZXZfbnVtfSAgKSkKCiAgI2VjaG8gICJsb3NldHVwOiAiIiRwYXRoX3RvX2ltZ19maWxlIgog
+IHN1ZG8gbG9zZXR1cCAiL2Rldi9sb29wJHtfbG9vcGRldl9udW19IiAgIiRwYXRoX3RvX2ltZ19m
+aWxlIgogIHJldD0kPzsgaWYgWyAhICIke3JldH0iID09IDAgXTt0aGVuIHsgcmV0dXJuIDE7IH07
+IGZpCiAgCiAgd2FpdGZvcmxvb3BkZXYgIiR7X2xvb3BkZXZfbnVtfSIgIiR7cGF0aF90b19pbWdf
+ZmlsZX0iCiAgI2VjaG8gImtwYXJ0eDogIiIvZGV2L2xvb3Ake19sb29wZGV2X251bX0iCiAgc3Vk
+byBrcGFydHggLWEgIi9kZXYvbG9vcCR7X2xvb3BkZXZfbnVtfSIKICByZXQ9JD87IGlmIFsgISAi
+JHtyZXR9IiA9PSAwIF07dGhlbiB7IHJldHVybiAxOyB9OyBmaQoKICB3YWl0Zm9yZmlsZSAiL2Rl
+di9tYXBwZXIvbG9vcCR7X2xvb3BkZXZfbnVtfXAxIgogICNlY2hvICJtb3VudDA6ICIiL2Rldi9t
+YXBwZXIvbG9vcCIiJHtfbG9vcGRldl9udW19IiJwMSIgIi9tbnQvIiIke21udF99IiIke192ZF9u
+dW19IgogIHN1ZG8gbW91bnQgIi9kZXYvbWFwcGVyL2xvb3AiIiR7X2xvb3BkZXZfbnVtfSIicDEi
+ICIvbW50LyIiJHttbnRffSIiJHtfdmRfbnVtfSIKICByZXQ9JD87IGlmIFsgISAiJHtyZXR9IiA9
+PSAwIF07dGhlbiB7IHJldHVybiAxOyB9OyBmaQoKICB0bXA9IiAgL21udC8iIiR7bW50X30iIiR7
+X3ZkX251bX0iCiAgZXZhbCAkX3JldD0nKCciJHt0bXBbQF19IicpJwoKICBpZiBbICIke19za2lw
+X29wdF9tb3VudH0iID09ICJ5IiBdOyB0aGVuCiAgICBpZiBbICIke19jaGVja19pbWdfZGlyc30i
+ID09ICJ5IiBdOyB0aGVuCiAgICAgIGxvY2FsIF9wYXRoMmNoZWNrPSIvbW50LyIiJHttbnRffSIi
+JHtfdmRfbnVtfSIiL29wdC8iIiR7b3B0X30iCiAgICAgIGNoZWNrX2ltZ293bmVyICIke19wYXRo
+MmNoZWNrfSIKICAgICAgcmV0PSQ/CiAgICAgIGlmIFsgISAiJHtyZXR9IiAtZXEgMCBdOyB0aGVu
+CiAgICAgICAgcmV0dXJuICAzOwogICAgICBmaQogICAgZmkKICAgIHJldHVybiAwOwogIGVsc2UK
+ICAgIGxvY2FsIF9wYXRoMmNoZWNrPSIvbW50LyIiJHttbnRffSIiJHtfdmRfbnVtfSIiL29wdC8i
+IiR7b3B0X30iCiAgICBjaGVja19pbWdvd25lciAiJHtfcGF0aDJjaGVja30iCiAgICByZXQ9JD8K
+ICAgIGlmIFsgISAiJHtyZXR9IiAtZXEgMCBdOyB0aGVuCiAgICAgIHJldHVybiAgMzsKICAgIGZp
+CiAgZmkKICAgICNtb3VudAogICAgIy9kZXYvbWFwcGVyL2xvb3AwcDEgb24gL21udC8kVVNFUi92
+ZDAgdHlwZSBleHQ0IChydykKICAgICNpbiBjYXNlIG9mIHVidW50dSAxMi4wNCBvciAxNC4wNAog
+ICAgICAjL21udC8kVVNFUi92ZDAvb3B0LyRVU0VSL3dvcmtzIG9uIC9vcHQvJFVTRVIvd29ya3Mg
+dHlwZSBub25lIChydyxiaW5kKQogICAgI2luIGNhc2Ugb2YgdWJ1bnR1IDE2LjA0CiAgICAgICMv
+ZGV2L21hcHBlci9sb29wMHAxIG9uIC9vcHQvJFVTRVIvd29ya3MgdHlwZSBleHQ0IChydyxyZWxh
+dGltZSxkYXRhPW9yZGVyZWQpCiAgICBvcHRfaXNfdXNlZF8xMjA0PWBtb3VudCB8IGVncmVwIC1p
+diBncmVwIHwgZWdyZXAgIm1udC4qJHtsb2dnZWRfdXNlcl9uYW1lX30uKnZkLipvcHQuKiR7bG9n
+Z2VkX3VzZXJfbmFtZV99Lip3b3Jrcy4qb24uKm9wdC4qJHtsb2dnZWRfdXNlcl9uYW1lX30uKndv
+cmtzImAKICAgIG9wdF9pc191c2VkXzE2MDQ9YG1vdW50IHwgZWdyZXAgLWl2IGdyZXAgfCBlZ3Jl
+cCAiZGV2LiptYXBwZXIuKmxvb3AuKnAuKm9uLipvcHQuKiR7bG9nZ2VkX3VzZXJfbmFtZV99Lip3
+b3Jrcy4qdHlwZSJgCiAgICAjZWNobyAib3B0X2lzX3VzZWQ6ICIiJG9wdF9pc191c2VkIgogICAg
+aWYgWyAhIC16ICIke29wdF9pc191c2VkXzEyMDR9IiBdOyB0aGVuCiAgICAgIHJldHVybiAyOwog
+ICAgZWxpZiBbICEgLXogIiR7b3B0X2lzX3VzZWRfMTYwNH0iIF07IHRoZW4KICAgICAgcmV0dXJu
+IDI7CiAgICBlbHNlCgogICAgICBzdWRvIG1vdW50IC1vIGJpbmQgIi9tbnQvIiIke21udF99IiIk
+e192ZF9udW19IiIvb3B0LyIiJHtvcHRffSIgICIvb3B0LyIiJHtvcHRffSIKICAgICAgcmV0PSQ/
+OyBpZiBbICAiJHtyZXR9IiAhPSAwIF07dGhlbiB7IHJldHVybiAxOyB9OyBmaQogICAgZmkKCiAg
+dG1wPSIgIC9tbnQvJHttbnRffSR7X3ZkX251bX0iCiAgdG1wKz0oIiAgL29wdC8ke29wdF99IikK
+ICBldmFsICRfcmV0PScoJyIke3RtcFtAXX0iJyknCgogIHJldHVybiAwCn0KCiNVbi1Nb3VudCBy
+YXcgaW1hZ2U6CiMgICBAcGFyYW0gIDogICAgICAgJDEgICAgICAgICAgICAgICAgICAgICAgICAg
+ICAgICBsb29wZGV2X251bV8KIyAgIEByZXQgICAgOiAgICAgICBpZiBbICQ/ICE9IDAgXTsgdGhl
+biAtPiBlcnJvcgp1bW91bnRfcmF3aW1nKCkgewogIGxvY2FsIF9sb29wZGV2X251bT0kMSAKCiAg
+bG9jYWwgX2ZpcnN0X2xvb3BkZXZfbnVtPSQoKCAke0xPT1BERVZfU1RBUlRfT0ZGU0VUfSArICgk
+e1VTRVJfTE9PUERFVl9NQVh9ICogKCR7bG9nZ2VkX3VzZXJfaWRffSAtICR7TE9XRVNUX1VTRVJf
+SUR9KSkgICApKQoKICAjMDEyLCAzNDUsdWlkPTEwMDEsZGV2bnVtPTQ7dmQ9MTsKICAjdmRfbnVt
+PV9sb29wZGV2X251bS1fZmlyc3RfZGV2X251bQogIGxvY2FsIF92ZF9udW09JCgoICR7X2xvb3Bk
+ZXZfbnVtfSAtICR7X2ZpcnN0X2xvb3BkZXZfbnVtfSAgKSkKCiAgCiAgI21vdW50CiAgI2NoZWNr
+IGlmIGdpdmVuIG51bWJlciBvZiBsb29wIGlzIGNvbm5lY3RlZCB3aXRoIG9wdCB1c2VyIHdvcmtz
+CiAgIy9kZXYvbWFwcGVyL2xvb3AxNXAxIG9uIC9tbnQvJFVTRVIvdmQwIHR5cGUgZXh0NCAocncp
+CiAgI2luIGNhc2Ugb2YgdWJ1bnR1IDEyLjA0IG9yIDE0LjA0CiAgICAjL21udC8kVVNFUi92ZDAv
+b3B0LyRVU0VSL3dvcmtzIG9uIC9vcHQvJFVTRVIvd29ya3MgdHlwZSBub25lIChydyxiaW5kKQog
+IGxvY2FsIF9pc21vdW50ZWQyb3B0dXNlcndvcmtzXzEyMDQ9YG1vdW50IHwgZWdyZXAgLWl2IGdy
+ZXAgfCBncmVwICJtbnQuKiR7bG9nZ2VkX3VzZXJfbmFtZV99Lip2ZCR7X3ZkX251bX0uKm9wdC4q
+JHtsb2dnZWRfdXNlcl9uYW1lX30uKndvcmtzLipvcHQuKiR7bG9nZ2VkX3VzZXJfbmFtZV99Lip3
+b3JrcyJgCgogICNpbiBjYXNlIG9mIHVidW50dSAxNi4wNAogICAgIy9kZXYvbWFwcGVyL2xvb3Aw
+cDEgb24gL29wdC8kVVNFUi93b3JrcyB0eXBlIGV4dDQgKHJ3LHJlbGF0aW1lLGRhdGE9b3JkZXJl
+ZCkKICBsb2NhbCBfaXNtb3VudGVkMm9wdHVzZXJ3b3Jrc18xNjA0PWBtb3VudCB8IGVncmVwIC1p
+diBncmVwIHwgZ3JlcCAiZGV2LiptYXBwZXIuKmxvb3Ake19sb29wZGV2X251bX1wMS4qb24uKm9w
+dC4qJHtsb2dnZWRfdXNlcl9uYW1lX30uKndvcmtzImAKCiAgZmluZG9mICIvbW50LyIiJHttbnRf
+fSIiJHtfdmRfbnVtfSIgCgogIGZpbmRfc21iX29mICIvb3B0LyIiJHtvcHRffSIKICAKICAjQWRk
+ZWQgZHVlIHRvIGRvY2tlciBhbmQgcmVtYWluaW5nIG1vdW50IHBvaW50cyBpbiAKICAjZ2V0X3Vt
+b3VudHMgJy9tbnQvJFVTRVIvdmQyLycgInVtb3VudF9hcnIiCiAgZ2V0X3Vtb3VudHMgIi9tbnQv
+JHttbnRffSR7X3ZkX251bX0vIiAidW1vdW50X2FyciIKICBsb2NhbCBfbW50cG9pbnQKICBmb3Ig
+X21udHBvaW50IGluICIke3Vtb3VudF9hcnJbQF19IjsgZG8gCiAgICBzdWRvIHVtb3VudCAiJHtf
+bW50cG9pbnR9IgogICAgcmV0PSIkPyI7IAogICAgWyAiJHtyZXR9IiAhPSAwIF0gJiYgcmV0dXJu
+IDExMQogIGRvbmUKICAKCiAgI2VjaG8gIl9pc21vdW50ZWQyb3B0dXNlcm5ldHdvcmtzXzE2MDQ6
+ICIiJF9pc21vdW50ZWQyb3B0dXNlcndvcmtzXzE2MDQiCiAgbG9jYWwgX3J0bXA9MAogIGlmIFsg
+ISAteiAiJHtfaXNtb3VudGVkMm9wdHVzZXJ3b3Jrc18xMjA0fSIgXTsgdGhlbgoJICBzdWRvIHVt
+b3VudCAiL29wdC8iIiR7b3B0X30iCgkgIHJldD0iJD8iOyBpZiBbICIke3JldH0iICE9IDAgXTt0
+aGVuIHsgX3J0bXA9JCgoICRfcnRtcCArIDEgKSk7IH07IGZpCiAgZmkKCiAgaWYgWyAhIC16ICIk
+e19pc21vdW50ZWQyb3B0dXNlcndvcmtzXzE2MDR9IiBdOyB0aGVuCgkgIHN1ZG8gdW1vdW50ICIv
+b3B0LyIiJHtvcHRffSIKCSAgcmV0PSIkPyI7IGlmIFsgIiR7cmV0fSIgIT0gMCBdO3RoZW4geyBf
+cnRtcD0kKCggJF9ydG1wICsgMiApKTsgfTsgZmkKICBmaQoKICBmaW5kX3NtYl9vZiAiL21udC8i
+IiR7bW50X30iIiR7X3ZkX251bX0iIAoKICBzdWRvIHVtb3VudCAiL21udC8iIiR7bW50X30iIiR7
+X3ZkX251bX0iCiAgcmV0PSIkPyI7IGlmIFsgIiR7cmV0fSIgIT0gMCBdO3RoZW4geyBfcnRtcD0k
+KCggJF9ydG1wICsgNCApKTsgfTsgZmkKCiAgc3VkbyBrcGFydHggLWQgICIvZGV2L2xvb3Ake19s
+b29wZGV2X251bX0iCiAgcmV0PSIkPyI7IGlmIFsgIiR7cmV0fSIgIT0gMCBdO3RoZW4geyBfcnRt
+cD0kKCggJF9ydG1wICsgOCApKTsgfTsgZmkKCiAgc3VkbyBsb3NldHVwIC1kICAiL2Rldi9sb29w
+JHtfbG9vcGRldl9udW19IgogIHNsZWVwIDAuNQogICNsb3NldHVwIGZ1bmN0aW9uIHJldHVybiAw
+IGV2ZW4gaWYgZGV2aWNlIHdhcyBub3QgdW4tbW91bnRlZAogIGxvY2FsIF9pc3VzZWQ9YGxvc2V0
+dXAgLWEgfCBlZ3JlcCAiZGV2Lipsb29wJHtfbG9vcGRldl9udW19OiJgCiAgc2xlZXAgMTsgaWYg
+WyAhIC16ICIke19pc3VzZWR9IiBdO3RoZW4geyBfcnRtcD0kKCggJF9ydG1wICsgMTYgKSk7IH07
+IGZpCgogIHJldHVybiAiJHtfcnRtcH0iCgp9CgoKI01vdW50IHFjb3cyIGltYWdlOgojICAgQHBh
+cmFtICA6ICAgICQxICAgbG9vcGRldl9udW1fCiMgICBAcmV0ICAgIDogICAgICAgaWYgWyAkPyAh
+PSAwIF07IHRoZW4gLT4gZXJyb3IKI1Nob3VsZCBub3QgYmUgdXNlZC4uLiBkdWUgdG8gbmJkIGRl
+dmljZSBudW1iZXIgCm1vdW50X3Fjb3cyaW1nKCkgewogIGxvY2FsIF9kZXZfbnVtPSQxCiAgI2xv
+Y2FsIF9yZXQ9JDIKICAKICBzdWRvIG1vZHByb2JlIG5iZAogIHJldD0kPzsgaWYgWyAhICR7cmV0
+fSA9PSAwIF07dGhlbiB7IHJldHVybiAxOyB9OyBmaQogIAogIHN1ZG8gcWVtdS1uYmQgLWMgIi9k
+ZXYvbmJkJHtfZGV2X251bX0iICIkcGF0aF90b19pbWdfZmlsZSIKICByZXQ9JD87IGlmIFsgISAk
+e3JldH0gPT0gMCBdO3RoZW4geyByZXR1cm4gMTsgfTsgZmkKICAKICBzdWRvIG1vdW50ICIvZGV2
+L25iZCR7X2Rldl9udW19cDEiICIvbW50LyIiJHttbnRffSIKICByZXQ9JD87IGlmIFsgISAke3Jl
+dH0gPT0gMCBdO3RoZW4geyByZXR1cm4gMTsgfTsgZmkKICAKICBzdWRvIG1vdW50IC1vIGJpbmQg
+Ii9tbnQvIiIke21udF99IiIvb3B0LyIiJHtvcHRffSIgICIvb3B0LyIiJHtvcHRffSIKICByZXQ9
+JD87IGlmIFsgISAke3JldH0gPT0gMCBdO3RoZW4geyByZXR1cm4gMTsgfTsgZmkKICAKICByZXR1
+cm4gMAp9CgojVW4tTW91bnQgcWNvdzIgaW1hZ2U6CiMgICBAcGFyYW0gIDogICAgJDEgICBsb29w
+ZGV2X251bV8KIyAgIEByZXQgICAgOiAgICAgICBpZiBbICQ/ICE9IDAgXTsgdGhlbiAtPiBlcnJv
+cgojU2hvdWxkIG5vdCBiZSB1c2VkLi4uIGR1ZSB0byBuYmQgZGV2aWNlIG51bWJlciAKdW1vdW50
+X3Fjb3cyaW1nKCkgewogIGxvY2FsIF9kZXZfbnVtPSQxCiAgCiAgc3VkbyB1bW91bnQgIi9vcHQv
+IiIke29wdF99IgogIHJldD0kPzsgaWYgWyAhICR7cmV0fSA9PSAwIF07dGhlbiB7IHJldHVybiAx
+OyB9OyBmaQogIAogIHN1ZG8gdW1vdW50ICIvbW50LyIiJHttbnRffSIKICByZXQ9JD87IGlmIFsg
+ISAke3JldH0gPT0gMCBdO3RoZW4geyByZXR1cm4gMTsgfTsgZmkKICAKICBzdWRvIHFlbXUtbmJk
+IC1kICIvZGV2L25iZCR7X2Rldl9udW19IgogIHJldD0kPzsgaWYgWyAhICR7cmV0fSA9PSAwIF07
+dGhlbiB7IHJldHVybiAxOyB9OyBmaQogIAogICNwcmludDA9YHBzIC1hdXggfCBncmVwIC1FICJx
+ZW11LW5iZC4qZGV2IiB8IGdyZXAgLXYgZ3JlcGAKCiAgcmV0dXJuIDAKfQoKCiNSZXR1cm4gdXNl
+ZCBsb29wZGV2aWNlIG51bWJlcnMgb2YgZ2l2ZW4gdXNlcjoKIyAgIEBwYXJhbSAgOiAgIFtvdXRw
+dXRdICAgOiAgICAkMSAgOiBkZWNsYXJlIC1hIHZkX251bQojICAgQHBhcmFtICA6ICAgW2lucHV0
+XSAgICA6ICAgICQyICA6IGxvb3BkZXZpY2UgbnVtYmVyIHdoaWNoIHdhcyBjdXJyZW50bHkgbW91
+bnRlZAojICAgQHJldCAgICA6ICAgICAgICAgICAgICA6ICAgIGlmIFsgJD8gLWVxIDEgXSAtPiBD
+cmVhdGVkIGRpcmVjdG9yaWVzID5vayA+IG5leHQgbW91bnQKIyAgICAgICAgICAgICAgICAgICAg
+ICAgICAgOiAgICBpZiBbICQ/IC1lcSAyIF0gLT4gRGlyZWN0b3JpZXMgd2VyZW50IGNyZWF0ZWQg
+PiBlcnJvciA+IGV4aXQgCnlvY3RvX2Vudl9wcmVwYXJlX2RpcnNfaW5faW1hZ2UgKCkgewogIGVj
+aG8gIiIKICBsb2NhbCBfbG9vcGRldl9udW09IiQyIgogIGxvY2FsIF9jbnQ9YG1vdW50IDI+L2Rl
+di9udWxsIHwgZWdyZXAgImRldi4qbWFwcGVyLipsb29wJHtfbG9vcGRldl9udW19cDEuKm1udC4q
+JHtsb2dnZWRfdXNlcl9uYW1lX30uKnZkIiB8IGF3ayAne2krPTF9RU5Ee3ByaW50IGl9J2AKICBp
+ZiBbICEgIiRfY250IiAtZXEgMSBdOyB0aGVuCiAgICByZXR1cm4gMgogIGZpCgogICAgI19tbnRf
+cG9pbnQgPT4gL21udC8kVVNFUi92ZDAKICAgIGxvY2FsIF9tbnRfcG9pbnQ9YG1vdW50IDI+L2Rl
+di9udWxsIHwgZWdyZXAgImRldi4qbWFwcGVyLipsb29wJHtfbG9vcGRldl9udW19cDEuKm1udC4q
+JHtsb2dnZWRfdXNlcl9uYW1lX30uKnZkIiB8IGF3ayAneyBwcmludCAkMyB9J2AKICAgIGxvY2Fs
+IF91c2VkX3NwYWNlPWBkZiAtaCAyPi9kZXYvbnVsbCAiJF9tbnRfcG9pbnQiICB8IGdyZXAgIiR7
+bG9nZ2VkX3VzZXJfbmFtZV99IiB8IGF3ayAneyBwcmludCAkNSB9J2AKICAgIGxvY2FsIF91c2Vk
+X3NwYWNlPSIke191c2VkX3NwYWNlOjotMX0iCgogICAgaWYgWyAiJF91c2VkX3NwYWNlIiAtbHQg
+MyBdOyB0aGVuIAoKICAgICAgZWNobyAiIFRoZSBpbWFnZSBpcyBtb3N0IHBvYmFibHkgYmxhbmsg
+KHVzZWQgc3BhY2UgPDMlKSBhbmQgcGFydGlhbHkgcHJlcGFpcmVkIGZvciBnaXZlbiB1c2VyLiIK
+ICAgICAgZWNobyAiIgogICAgICBlY2hvICIgRG8geW91IHdhbm5hIGNyZWF0ZSBmb2xkZXJzIGlu
+IGltYWdlIGluIG9yZGVyIHRvIG1vdW50IGltYWdlIHByb3Blcmx5IGZvciBjdXJyZW50IHVzZXIg
+PyB5L24iCiAgICAgIAogICAgICBpZiBbICIkYWxseV9hdXRvX21vZGUiICE9ICJ5IiBdOyB0aGVu
+CiAgICAgICAgcmVhZCAtcCAiID4iIHluCiAgICAgIGVsc2UKICAgICAgICB5bj0ieSIKICAgICAg
+ZmkKICAgICAgCiAgICAgIGlmIFsgIiR5biIgPT0gInkiIF07IHRoZW4gCgogICAgICAgICNDcmVh
+dGUgZm9sZGVycyBpbiBpbWFnZSAKICAgICAgICBzdWRvIG1rZGlyIC1wICIke19tbnRfcG9pbnR9
+IiIvb3B0LyIiJG9wdF8iCiAgICAgICAgc3VkbyBjaG93biAtUiAiJHtsb2dnZWRfdXNlcl9uYW1l
+X30iOiIke2xvZ2dlZF91c2VyX25hbWVffSIgICIke19tbnRfcG9pbnR9IiIvb3B0LyIiJHtsb2dn
+ZWRfdXNlcl9uYW1lX30iCiAgICAgICAgc3VkbyBjaG1vZCA3NzAgLVIgIiR7X21udF9wb2ludH0i
+Ii9vcHQvIiIke2xvZ2dlZF91c2VyX25hbWVffSIKCiAgICAgICAgc3VkbyBjaG93biAiJHtsb2dn
+ZWRfdXNlcl9uYW1lX30iOiIke2xvZ2dlZF91c2VyX25hbWVffSIgICIke19tbnRfcG9pbnR9IiIv
+b3B0LyIKICAgICAgICBzdWRvIGNobW9kIDc3MCAiJHtfbW50X3BvaW50fSIiL29wdC8iCgogICAg
+ICAgIHNsZWVwIDEKCiAgICAgICAgbG9jYWwgX3JldD0iJDEiOwoKICAgICAgICAjcmV0dXJuIHZk
+IFggbnVtYmVyID4gbW91bnQgcG9pbnQgaWQKICAgICAgICBldmFsICIkX3JldCI9IiR7X21udF9w
+b2ludCMjKnZkfSI7CgogICAgICAgIHJldHVybiAxCgogICAgICBmaQoKICAgICAgcmV0dXJuIDIK
+CiAgICBmaQoKfQoKIyBAcGFyYW0gJDEgCS1lbXB0eSBwYXJhbWV0ZXIJOiB0cnkgdG8gbW91bnQg
+CiMJCSAgICAgICAgLXNvbWUgc3RyaW5nCQk6IHRyeSB0byB1bm1vdW50CiMgCm1haW5iYXNoICgp
+IHsKCiAgZWNobyAiIgoKICBlY2hvIC1lICJJbnB1dCBQYXJhbWV0ZXJzOiBcbiIKICBlY2hvIC1l
+ICIgIE9wZXJhdGlvbiAgICAgICAgICAgICAgICAgICAgICAgOiAiIiRvcGVyYXRpb24iCiAgZWNo
+byAtZSAiICBQYXRoIHRvIGltYWdlIGZpbGUgICAgICAgICAgICAgIDogIiIkcGF0aF90b19pbWdf
+ZmlsZSIKICBlY2hvIC1lICIgIFNraXAgb3B0IG1vdW50ICAgICAgICAgICAgICAgICAgOiAiIiRz
+a2lwX29wdF9tb3VudCIKICBlY2hvIC1lICIgIE1vdW50IHBvaW50IGlkICAgICAgICAgICAgICAg
+ICAgOiAiIiRtb3VudF9wb2ludF9pZCIKICBlY2hvIC1lICIgIFJ1biBhcyB1c2VyICAgICAgICAg
+ICAgICAgICAgICAgOiAiIiRydW5hc3VzZXIiCiAgZWNobyAtZSAiICBDaGVjayBpbWcgZGlyKC9v
+cHQvVVNFUi93b3JrcykgIDogIiIkY2hlY2tfaW1nX2RpcnMiCiAgZWNobyAiIgogIAogICM9R0xP
+QkFMX1ZBUklBQkxFUz09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PQog
+IG1udF89IiR7bG9nZ2VkX3VzZXJfbmFtZV99L3ZkIgogIG9wdF89IiR7bG9nZ2VkX3VzZXJfbmFt
+ZV99L3dvcmtzLyIKICAjPUdMT0JBTF9WQVJJQUJMRVM9PT09PT09PT09PT09PT09PT09PT09PT09
+PT09PT09PT09PT09PT09PT0KCiAgaWYgWyAiJG9wZXJhdGlvbiIgPSAiaW5mbyIgXTsgdGhlbgog
+ICAgZWNobyAtZSAiVXNlZCBMb29wIERldmljZXM6IgoKICAgIGdldF91c2VkbG9vcGRldl9udW0g
+Il91c2Rsb29wZGV2cyIKICAgIGZvciBfdWxkZXZuIGluICIke191c2Rsb29wZGV2c1tAXX0iOyBk
+bwogICAgICBibGE9JChzdWRvIGxvc2V0dXAgLWEgfCBlZ3JlcCAiZGV2Lipsb29wJHtfdWxkZXZu
+fTouKnFlbXVyYXdpbWciKQogICAgICBlY2hvICIgICR7YmxhfSIKICAgIGRvbmUKICAgIGVjaG8K
+ICAgIHJldHVybiAwOwogIGVsaWYgWyAiJG9wZXJhdGlvbiIgPSAibW91bnQiIF07IHRoZW4KICAg
+IE1OVF9TVFJJTkc9Inw9TU9VTlQ9PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09IgogICAg
+ZWNobyAke01OVF9TVFJJTkd9OyBlY2hvICIiCiAgICAKICAgIHByZXBhcmVfZGlycwoKICAgIGlm
+IFsgLXogIiRwYXRoX3RvX2ltZ19maWxlIiAgXSB8fCBbICIkcGF0aF90b19pbWdfZmlsZSIgPT0g
+IiIgIF07IHRoZW4KICAgIAogICAgICBpZiBbIC1kICIke0lNQUdFX0RJUn0vJHtsb2dnZWRfdXNl
+cl9uYW1lX30iIF07IHRoZW4KICAgICAgICBlY2hvICAiQ3VycmVudCBmb2xkZXIgaXMgIiciJyIk
+e0lNQUdFX0RJUn0vJHtsb2dnZWRfdXNlcl9uYW1lX30iJyInCiAgICAgICAgZWNobyAiIgogICAg
+ICAgIGNkICIke0lNQUdFX0RJUn0vJHtsb2dnZWRfdXNlcl9uYW1lX30iCiAgICAgIGVsc2UKICAg
+ICAgICBpZiBbIC1kICIke0lNQUdFX0RJUn0iIF07IHRoZW4KICAgICAgICAgIGVjaG8gJyBVc2Vy
+YHMgZm9sZGVyIGRvZXMgbm90IGV4aXN0LCBjdXJyZW50IGZvbGRlciBpcyAnIiR7SU1BR0VfRElS
+fSEiICAKICAgICAgICAgIGVjaG8gIiIKICAgICAgICAgIGNkICIke0lNQUdFX0RJUn0iCiAgICAg
+ICAgZmkKICAgICAgZmkKICAgICAgZWNobyAiIFBsZWFzZSBlbnRlciB0aGUgcGF0aCB0byB0aGUg
+aW1hZ2UgZmlsZToiCiAgICAgIHJlYWQgLXAgIiA+IiAgLWUgIHBhdGhfdG9faW1nX2ZpbGUKICAg
+IGZpCgogICAgaWYgWyAhIC1mICIkcGF0aF90b19pbWdfZmlsZSIgXSB8fCBbIC16ICIkcGF0aF90
+b19pbWdfZmlsZSIgXTsgdGhlbgogICAgICBlY2hvICIgRXJyb3I6IEltYWdlIGZpbGUgbm90IGZv
+dW5kICEgRXhpdGluZyI7IGVjaG8gJHtNTlRfU1RSSU5HfQogICAgICByZXR1cm4gMQogICAgZmkK
+CiAgICBpc3Jhd2ltZz1gZWNobyAiJHBhdGhfdG9faW1nX2ZpbGUiIHwgZ3JlcCAtRSAiXC4uKnJh
+dyJgCiAgICAjaXNxY293MmltZz1gZWNobyAiJHBhdGhfdG9faW1nX2ZpbGUiIHwgZ3JlcCAtRSAi
+XC4uKnFjb3cyImAKCiAgICBpZiBbICEgLXogIiRpc3Jhd2ltZyIgXTsgdGhlbgogICAgICAjZWNo
+byAiIE1PVU5USU5HIFJBVyBJTUFHRToiCgogICAgICBnZXRfZnJlZWxvb3BkZXZfbnVtICJfZnJl
+ZWxvb3BkZXZfbnVtXyIKICAgICAgcmV0Xz0iJD8iOwogICAgICBpZiBbICR7cmV0X30gIT0gMCBd
+OyB0aGVuCiAgICAgICAgIGVjaG8gLWUgIlxuIEVycm9yOiBBbnkgZnJlZSBsb29wIGRldmljZXMg
+ISBFeGl0aW5nIjsgCiAgICAgICAgIG1udF9zdGF0Xz0ke3JldF99CiAgICAgIGVsc2UKICAgICAK
+ICAgICAgICBpZiBbICIke21vdW50X3BvaW50X2lkfSIgPT0gIiIgXTsgdGhlbgogICAgICAgICAg
+I21vdW50IHBvaW50IGlkIGlzIG5vdCBkZWZpbmVkIC0+IGF1dG8gbW9kZQogICAgICAgICAgbW91
+bnRfcmF3aW1nICIke19mcmVlbG9vcGRldl9udW1ffSIgIiR7c2tpcF9vcHRfbW91bnR9IiAiJHtj
+aGVja19pbWdfZGlyc30iICJjdXJfbW50X3BvaW50cyIKICAgICAgICAgIG1udF9zdGF0Xz0iJD8i
+CiAgICAgICAgZWxzZSAKICAgICAgICAgICNtb3VudCBwb2ludCBpZCBpcyBkZWZpbmVkIC0+IGNo
+ZWNrIGlmIHJlbGF0ZWQgbG9vcGRldm51bSBpcyBhdmFpbGFibGUgCiAgICAgICAgICAgIGdldF9s
+b29wZGV2bnVtICIke21vdW50X3BvaW50X2lkfSIgIl9mcmVlbG9vcGRldl9udW1fIgogICAgICAg
+ICAgICByZXQ9JD8KICAgICAgICAgICAgaWYgWyAhICIkcmV0IiAtZXEgMCBdOyB0aGVuIAogICAg
+ICAgICAgICAgIGVjaG8gLWUgIlxuIEVycm9yOiBHaXZlbiBtb3VudC1wb2ludC1pZCBpcyBvY2N1
+cGllZCwgbm8gZnJlZSBsb29wIGRldmljZXMgISBFeGl0aW5nIjsgCiAgICAgICAgICAgICAgbW50
+X3N0YXRfPSR7cmV0fQogICAgICAgICAgICBlbHNlCiAgICAgICAgICAgICAgbW91bnRfcmF3aW1n
+ICIke19mcmVlbG9vcGRldl9udW1ffSIgIiR7c2tpcF9vcHRfbW91bnR9IiAiJHtjaGVja19pbWdf
+ZGlyc30iICJjdXJfbW50X3BvaW50cyIKICAgICAgICAgICAgICBtbnRfc3RhdF89IiQ/IiAgICAg
+ICAgICAgICAgICAKICAgICAgICAgICAgZmkKICAgICAgICBmaQogICAgICAgIAogICAgICAgIGlm
+IFsgIiR7bW50X3N0YXRffSIgLWVxIDIgXTsgdGhlbgoKICAgICAgICAgZWNobyAiIgogICAgICAg
+ICBlY2hvICIgRXJyb3IvV2FybmluZzogVGhlIG1vdW50IGRlc3RpbmF0aW9uIiAnIi9vcHQvJyR7
+bG9nZ2VkX3VzZXJfbmFtZV99Jy93b3JrcyInJyBpcyBhbHJlYWR5IGluIHVzZScKICAgICAgICAg
+ZWNobyAiIFRoZSByZXN0IG9mIG1vdW50IHN0ZXBzIHdhcmUgc3VjY2Vzc2Z1bGx5IGZpbmlzaGVk
+IgoKICAgICAgICBmaQoKICAgICAgICBpZiBbICIke21udF9zdGF0X30iIC1lcSAzIF07IHRoZW4K
+CiAgICAgICAgICBlY2hvICIiCiAgICAgICAgICBlY2hvICIgRXJyb3I644CAVGhlIGN1cnJlbnQg
+dXNlciBkaWZmZXJzIGZyb20gaW1hZ2UgdXNlci4gICIKICAgICAgICAgIGVjaG8gIiAgICAgICDj
+gIBQbGVhc2UgY2hlY2sgaWYgeW91IGhhdmUgZm9sbG93aW5nIHBhdGggb24gaW1hZ2U6IC9tbnQv
+VVNFUk5BTUUvdmRYL29wdC9VU0VSTkFNRS93b3Jrcy8iCiAgICAgICAgICBlY2hvICIgICAgICAg
+ICAiIAoKICAgICAgICAgIHlvY3RvX2Vudl9wcmVwYXJlX2RpcnNfaW5faW1hZ2UgInZkX251bV9m
+aXhlZCIgIiR7X2ZyZWVsb29wZGV2X251bV99IgogICAgICAgICAgcmV0PSIkPyIKICAgICAgICAg
+IGlmIFsgIiR7c2tpcF9vcHRfbW91bnR9IiA9PSAieSIgXTsgdGhlbgogICAgICAgICAgICBtbnRf
+c3RhdF89IjAiCiAgICAgICAgICBlbHNlCiAgICAgICAgICAgIGlmIFsgIiR7cmV0fSIgLWVxIDEg
+XTsgdGhlbgogICAgICAgICAgICAgIHN1ZG8gbW91bnQgLW8gYmluZCAiL21udC8iIiR7bW50X30i
+IiR7dmRfbnVtX2ZpeGVkfSIiL29wdC8iIiR7b3B0X30iICAiL29wdC8iIiR7b3B0X30iCiAgICAg
+ICAgICAgICAgY3VyX21udF9wb2ludHMrPSgiL29wdC8ke29wdF99XG4iKQogICAgICAgICAgICAg
+IG1udF9zdGF0Xz0iMCIKICAgICAgICAgICAgZmkKICAgICAgICAgIGZpCgogICAgICAgIGZpCgog
+ICAgICBmaQoKICAgIGZpCgoKICAgICNpZiBbICEgLXogIiRpc3Fjb3cyaW1nIiBdOyB0aGVuCiAg
+ICAjICAgIGVjaG8gIiBNT1VOVElORyBRQ09XMiBJTUFHRToiCiAgICAjICAgIGVjaG8gIiBFcnJv
+cjogTm90IHN1cHBvcnRlZCwgaWYgdSBuZWVkIGl0IHUgY2FuIGRvIGl0ICIKICAgICMgICAgZXhp
+dCAwCiAgICAjZmkKCiAgICBlY2hvICIiCiAgICBlY2hvICIgQWRkZWQgbW91bnQgcG9pbnRzOiIK
+ICAgIGZvciBtcCBpbiAiJHtjdXJfbW50X3BvaW50c1tAXX0iOyBkbwogICAgICBlY2hvIC1lICIg
+ICIiJG1wIgogICAgZG9uZQogICAgCgogICAgZWNobyAgIiIKICAgIGlmIFsgIiR7bW50X3N0YXRf
+fSIgIT0gMCBdOyB0aGVuCiAgICAgIGVjaG8gIiBNT1VOVD5FUlJPUlske21udF9zdGF0X31dIgog
+ICAgZWxzZQogICAgICBlY2hvICIgTU9VTlQ+T0tbJHttbnRfc3RhdF99XSIKICAgIGZpCiAgICBl
+Y2hvICIiCgogIGVsaWYgWyAiJG9wZXJhdGlvbiIgPSAidW1vdW50IiBdOyB0aGVuCiAgICBNTlRf
+U1RSSU5HPSJ8PVVOLU1PVU5UPT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PSIKCiAgICBl
+Y2hvICR7TU5UX1NUUklOR307IGVjaG8gIiIKCiAgICAjL2Rldi9sb29wMTogWzAwMjNdOjIzMDQy
+NjQxOTYgKC9tbnQvbmFzX3JhaWQxMC9zaGFyZS90bXAvMjAxNDEwMDJfY2xlYW5fZnNsX2JzcF9z
+YWJyZWF1dG8vX2JyZDIwMTQxMTE0X2ZzbF9ic3Bfc2FicmVhdXRvX2tlcm5lbDMxMDE3XzQwR0Jf
+ZXh0NC5xZW11cmF3aW1nKQogICAgI2lzcmF3aW1nPWBzdWRvIGxvc2V0dXAgLWEgMj4vZGV2L251
+bGwgfCBncmVwIC1FICJkZXYuKmxvb3AiIHwgZ3JlcCAtRSAiXC4uKnJhdyJgCiAgICAjaXNxY293
+MmltZz1gcHMgLWF1eCB8IGdyZXAgLXYgZ3JlcCB8IGdyZXAgInFlbXUtbmJkIiB8IGdyZXAgLUUg
+ImRldi4qbmJkIiB8IGdyZXAgLUUgIlwuLipxY293MiJgCgogICAgZ2V0X3VzZWRsb29wZGV2X251
+bSAiX3VzZWRsb29wZGV2X251bV8iCgogICAgaWYgWyAiJHsjX3VzZWRsb29wZGV2X251bV9bQF19
+IiAhPSAwIF07IHRoZW4KCiAgICAgIGlmIFsgIiR7YWxseV9hdXRvX21vZGV9IiA9PSAieSIgXTsg
+dGhlbgogICAgICAgICAgbW50X3N0YXRfPSIwIgogICAgICAgICAgZm9yIHVzZWRfbG9vcGRldl9u
+dW0gaW4gIiR7X3VzZWRsb29wZGV2X251bV9bQF19IjsgZG8KICAgICAgICAgICAgbG9jYWwgX3Jl
+bV9sb29wZGV2X251bT0kKCggJHttb3VudF9wb2ludF9pZH0gKyAke0xPT1BERVZfU1RBUlRfT0ZG
+U0VUfSArICgke1VTRVJfTE9PUERFVl9NQVh9ICogKCR7bG9nZ2VkX3VzZXJfaWRffSAtICR7TE9X
+RVNUX1VTRVJfSUR9ICkpICAgKSkKCiAgICAgICAgICAgIGlmIFsgIiR7dXNlZF9sb29wZGV2X251
+bX0iIC1lcSAiJHtfcmVtX2xvb3BkZXZfbnVtfSIgXTsgdGhlbgogICAgICAgICAgICAgIHVtb3Vu
+dF9yYXdpbWcgIiR7X3JlbV9sb29wZGV2X251bX0iCiAgICAgICAgICAgICAgbW50X3N0YXRfPSIk
+PyIKICAgICAgICAgICAgICBicmVhawogICAgICAgICAgICBmaQogICAgICAgICAgZG9uZQoKICAg
+ICAgZWxzZQogICAgICAgIGlmIFsgIiR7I191c2VkbG9vcGRldl9udW1fW0BdfSIgPT0gMSBdOyB0
+aGVuCiAgICAgICAgICB1bW91bnRfcmF3aW1nICIke191c2VkbG9vcGRldl9udW1fWzBdfSIKICAg
+ICAgICAgIG1udF9zdGF0Xz0iJD8iCiAgICAgICAgZWxzZQogICAgICAgICAgZWNobyAiIgogICAg
+ICAgICAgZWNobyAnIFlvdSBhcmUgdXNpbmcgbW9yZSB0aGFuIG9uZSBsb29wIGRldmljZSwgd2hh
+dCBkbyB5b3Ugd2FudCB0byB1bi1tb3VudD8nCiAgICAgICAgICAgIGZvciBsb29wZGV2X251bSBp
+biAiJHtfdXNlZGxvb3BkZXZfbnVtX1tAXX0iOyBkbwogICAgICAgICAgICAgICMvZGV2L2xvb3Ax
+OiBbMDAyM106MjMwNDI2NDE5NiAoL21udC9uYXNfcmFpZDEwL3NoYXJlL3RtcC8yMDE0MTAwMl9j
+bGVhbl9mc2xfYnNwX3NhYnJlYXV0by9fYnJkMjAxNDExMTRfZnNsCiAgICAgICAgICAgICAgIF90
+bXA9YGxvc2V0dXAgLWEgMj4vZGV2L251bGwgfCBhd2sgJ3twcmludCAkMSAkM30nIHwgZWdyZXAg
+ImRldi4qbG9vcCR7bG9vcGRldl9udW19OiJgCiAgICAgICAgICAgICAgIGVjaG8gIiAgJHtfdG1w
+fSIKICAgICAgICAgICAgZG9uZQogICAgICAgICAgICBlY2hvICIiCiAgICAgICAgICAgIGVjaG8g
+JyBFbnRlciB0aGUgbnVtYmVyIG9mIGxvb3AgZGV2aWNlOicKICAgICAgICAgICAgcmVhZCBfY2hv
+b3NlZF9sb29wZGV2X251bQogICAgICAgICAgICB1bW91bnRfcmF3aW1nICIke19jaG9vc2VkX2xv
+b3BkZXZfbnVtfSIKICAgICAgICAgICAgbW50X3N0YXRfPSIkPyIKICAgICAgICBmaQogICAgICBm
+aQogICAgICAKICAgIGVsc2UKICAgICAgZWNobyAiIEVycm9yOiBOb3RoaW5nIHRvIHVuLW1vdW50
+ISAiO2VjaG8gIiIKICAgICAgZWNobyAke01OVF9TVFJJTkd9O2VjaG8gIiIKICAgICAgcmV0dXJu
+IDAKICAgIGZpCiAgICAKICAgIGlmIFsgIiR7bW50X3N0YXRffSIgLWd0IDMgXTsgdGhlbgogICAg
+IGVjaG8gIiBVTi1NT1VOVD5FUlJPUlske21udF9zdGF0X31dIgogICAgZWxzZQogICAgIGVjaG8g
+IiBVTi1NT1VOVD5PS1ske21udF9zdGF0X31dIgogICAgZmkKCiAgICBfdG1wPSggYHN1ZG8gbG9z
+ZXR1cCAtYSB8IGF3ayAne3ByaW50ICQxICQzfScgfCBlZ3JlcCAiZGV2Lipsb29wImAgKQogICAg
+ZWNobyAiIgogICAgZWNobyAiICBVc2VkIGFsbCBsb29wIGRldmljZXMgOiIKICAgIGZvciBsaW5l
+IGluICIke190bXBbQF19IjsgZG8KICAgIAllY2hvICIgICAke2xpbmV9IgogICAgZG9uZQogICAg
+ZWNobyAiIgoKICAgICNpZiBbICEgLXogIiRpc3Jhd2ltZyIgXTsgdGhlbgogICAgIyAgZWNobyAi
+VU4tTU9VTlRJTkcgUkFXIElNQUdFOiIKICAgICMgIHVtb3VudF9yYXdpbWcKICAgICNmaQoKICAg
+ICNpZiBbICEgLXogIiRpc3Fjb3cyaW1nIiBdOyB0aGVuCiAgICAjICBlY2hvICJVTi1NT1VOVElO
+RyBRQ09XMiBJTUFHRToiCiAgICAjICBlY2hvICIgRXJyb3I6IE5vdCBzdXBwb3J0ZWQsIGlmIHUg
+bmVlZCBpdCB1IGNhbiBkbyBpdCAiCiAgICAjICBleGl0IDAKICAgICNmaQoKICBmaQogIAogIGVj
+aG8gJHtNTlRfU1RSSU5HfTtlY2hvICIiCiAgcmV0dXJuICR7bW50X3N0YXRffQoKfQoKCkxPT1BE
+RVZfU1RBUlRfT0ZGU0VUPSIkezF9IgpMT1dFU1RfVVNFUl9JRD0iJHsyfSIKVVNFUl9MT09QREVW
+X01BWD0iJHszfSIKSU1BR0VfRElSPSIkezR9IgpvcGVyYXRpb249IiR7NX0iCnBhdGhfdG9faW1n
+X2ZpbGU9IiR7Nn0iCnNraXBfb3B0X21vdW50PSIkezd9IgpjaGVja19pbWdfZGlycz0iJHs4fSIK
+bW91bnRfcG9pbnRfaWQ9IiR7OX0iCnJ1bmFzdXNlcj0iJHsxMH0iCmFsbHlfYXV0b19tb2RlPSIk
+ezExfSIKbG9nZ2VkX3VzZXJfaWRfPSIkezEyfSIKbG9nZ2VkX3VzZXJfbmFtZV89IiR7MTN9IgoK
+I2VjaG8gTE9PUERFVl9TVEFSVF9PRkZTRVQ9JExPT1BERVZfU1RBUlRfT0ZGU0VUCiNlY2hvIExP
+V0VTVF9VU0VSX0lEPSRMT1dFU1RfVVNFUl9JRAojZWNobyBVU0VSX0xPT1BERVZfTUFYPSRVU0VS
+X0xPT1BERVZfTUFYCiNlY2hvIElNQUdFX0RJUj0kSU1BR0VfRElSCiNlY2hvIG9wZXJhdGlvbj0k
+b3BlcmF0aW9uCiNlY2hvIHBhdGhfdG9faW1nX2ZpbGU9JHBhdGhfdG9faW1nX2ZpbGUKI2VjaG8g
+c2tpcF9vcHRfbW91bnQ9JHNraXBfb3B0X21vdW50CiNlY2hvIGNoZWNrX2ltZ19kaXJzPSRjaGVj
+a19pbWdfZGlycwojZWNobyBtb3VudF9wb2ludF9pZD0kbW91bnRfcG9pbnRfaWQKI2VjaG8gcnVu
+YXN1c2VyPSRydW5hc3VzZXIKI2VjaG8gYWxseV9hdXRvX21vZGU9JGFsbHlfYXV0b19tb2RlCiNl
+Y2hvIGxvZ2dlZF91c2VyX2lkXz0kbG9nZ2VkX3VzZXJfaWRfCiNlY2hvIGxvZ2dlZF91c2VyX25h
+bWVfPSRsb2dnZWRfdXNlcl9uYW1lXwoKCkRFUEVOREVOQ0lFU19MSVNUPSggImdyZXAgLS1oZWxw
+IDAiICJlZ3JlcCAtLWhlbHAgMCIgImF3ayAtLWhlbHAgMCIgIm1rZGlyIC0taGVscCAwIiAiY2ht
+b2QgLS1oZWxwIDAiIFwKICAgICAgICAgICAgICAgICAgICAiY2hvd24gLS1oZWxwIDAiICJsb3Nl
+dHVwIC0taGVscCAwIiAia3BhcnR4IC0taGVscCAxIiAibW91bnQgLS1oZWxwIDAiICJpZCAtLWhl
+bHAgMCIgXAogICAgICAgICAgICAgICAgICAgICJzbWJzdGF0dXMgLS1oZWxwIDEiICJzbWJjb250
+cm9sIC0taGVscCAxIiAibHNvZiAtaCAwIiApCmRlcGVuZGVuY2llc190ZXN0CnJldD0kPwpbICIk
+e3JldH0iICE9ICIwIiBdICYmIGV4aXQgMQoKCm1haW5iYXNo
+
+/usr/local/bin/umess.sh
+IyEvYmluL2Jhc2gKIz09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09
+PT09PT09PT09PT09PT09PT09PT09PT09CiMgTkFNRSAgICAgICAgICA6ICAgICAgIHVtZXNzLnNo
+CiMgQVVUSE9SICAgICAgICA6ICAgICAgIEFuZHJ5cyBKaXJpLCBBTEpQMjIxMDA1OTIKIyBEQVRF
+ICAgICAgICAgIDogICAgICAgMjAxNi4xMS4yMgojIFZFUlNJT04gICAgICAgOiAgICAgICAxLjEK
+IyBERVBFTkRFTkNJRVM6ICAgICAgICAgCiMgICAgICAgICAgICAgICAxKWJpbmFyaWVzOiBiYXNo
+LCBlZ3JlcCwgZ3JlcCwgYXdrLCBub3RpZnktc2VuZCwgdXNlcnMsIHN1ZG8gdGVlCiMKIyBERVND
+UklQVElPTiAgIDogICAgICAgCiMgICAgICAgU2NyaXB0IGZvciBzZW5kaW5nIG1lc3NhZ2VzIHRv
+IHVzZXIgdG8gR1VJIGFuZCB0byB0ZXJtaW5hbHMKIz09PT09PT09PT09PT09PT09PT09PT09PT09
+PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09CgpoZWxwKCkgeyBlY2hv
+IC1lICJcbiBIZWxwOiBcbiAkMCBbLXUgPHVzZXJuYW1lPiBdIFstbSA8dGV4dCBtZXNzYWdlPiBd
+IFstYSAgfCBzZW5kIG1lc3NhZ2UgdG8gYWxsIHVzZXJzIF1cbiI7IGV4aXQgMDsgfQoKcHJpbnRf
+cG9ydF9vbmx5PTAKdG9fYWxsPTAKc2VuZF9tZXNzYWdlPSIiCm5vdGlmX3BpY3R1cmU9IiIKCndo
+aWxlIGdldG9wdHMgIjp1OmhhbTpwOiIgcDsgZG8KCWNhc2UgIiR7cH0iIGluCgkJdSkKCQkJdXNl
+cl89IiR7T1BUQVJHfSIKCQkJOzsKCQlhKQoJCQl0b19hbGw9MQoJCQk7OwoJCW0pCgkJCXNlbmRf
+bWVzc2FnZT0iJHtPUFRBUkd9IgoJCQk7OwoJCXApCiAgICAgICAgICAgIG5vdGlmX3BpY3R1cmU9
+IiR7T1BUQVJHfSIKICAgICAgICAgICAgOzsKCQloKQoJCQloZWxwCgkJCTs7Cgllc2FjCmRvbmUK
+ClsgJCMgLWVxIDAgXSAmJiBoZWxwCgoKaWYgWyAteiAiJHt1c2VyX30iIF07IHRoZW4KICB1cz0i
+JFVTRVIiCmVsc2UKICB1cz0iJHt1c2VyX30iCmZpCgoKaWYgWyAhIC16ICIke3NlbmRfbWVzc2Fn
+ZX0iIF07IHRoZW4KCiAgdGVybV9pZHNfYXJyPSggYGxzIC1sdCAvZGV2L3B0cyB8IGdyZXAgIiR7
+dXN9IiB8IGF3ayAneyBwcmludCAkTkYgfSdgICkKCiAgdGVybV9tZXNzPSJcbldBUk5JTkchIFxu
+JGRlbGltXG4gICRzZW5kX21lc3NhZ2UgXG4kZGVsaW1cbldBUk5JTkchIFxuIgogIHRlcm1fbWVz
+cz0iXGVbMzFtJHt0ZXJtX21lc3N9XGVbMG0iCgoKICBmb3IgdGVybV9pZCBpbiAiJHt0ZXJtX2lk
+c19hcnJbQF19IjsgZG8KICAgIGVjaG8gLWUgIiR7dGVybV9tZXNzfSIgfCBzdWRvIHRlZSAiL2Rl
+di9wdHMvIiIke3Rlcm1faWR9IiA+IC9kZXYvbnVsbCAyPiYxCiAgZG9uZQoKICAjWDAsWDEwLFgx
+MSBldGMgLi4uCiAgZGlzcF9pZHNfYXJyPSggJChscyAtbHQgL3RtcC8uWDExLXVuaXgvIHwgZ3Jl
+cCAiJHt1c30iIHwgYXdrICd7IHByaW50ICRORiB9JykgKQoKICBmb3IgZGlzcF9pZCBpbiAiJHtk
+aXNwX2lkc19hcnJbQF19IjsgZG8KICAgIGRpc3BfaWQ9IiR7ZGlzcF9pZCMjKlh9IgogICAgc3Vk
+byAtdSAiJHt1c30iIERJU1BMQVk9OiIke2Rpc3BfaWR9IiBub3RpZnktc2VuZCAtdSAiY3JpdGlj
+YWwiIC1pICIke25vdGlmX3BpY3R1cmV9IiAiV0FSTklORyIgXCAiXG4ke3NlbmRfbWVzc2FnZX1c
+biIKICBkb25lCiAgCiAgCiAgI2NhbnQgZmluZCB1bml2ZXJzYWwgYm9uZCBiZXR3ZWVuIHVzZXIg
+YW5kIERJU1BMQVkgSUQgYW5kIHNlc3Npb24gb2YgZ2l2ZW4gdXNlciBpbiBjYXNlIG9mIGxvY2Fs
+IHJlYWwgZGlzcGxheQogICN3aG8gY29tbWFuZCBrbm93cwogIGRpc3BfaWRzX2FycjI9KCAkKHdo
+byB8IGdyZXAgIiR7dXN9IiB8IGdyZXAgIig6IiB8IGF3ayAne25ldz0kTkY7aWYob2xkIT1uZXcp
+e3ByaW50ICRORjsgb2xkPSRORn0gfScpICkKICAjKDowLjApCiAgZm9yIGRpc3BfaWQgaW4gIiR7
+ZGlzcF9pZHNfYXJyMltAXX0iOyBkbwogICAgZGlzcF9pZD0iJHtkaXNwX2lkOjI6MX0iCiAgICBz
+dWRvIC11ICIke3VzfSIgRElTUExBWT06IiR7ZGlzcF9pZH0iIG5vdGlmeS1zZW5kIC11ICJjcml0
+aWNhbCIgLWkgIiR7bm90aWZfcGljdHVyZX0iICJXQVJOSU5HIiBcICJcbiR7c2VuZF9tZXNzYWdl
+fVxuIgogIGRvbmUKICAKZmkKCmlmIFsgIiR7dG9fYWxsfSIgLWVxIDEgXTsgdGhlbgoKICBfbG9n
+ZF91c2Vycz0oICQodXNlcnMgfCBhd2sgJ3tuPXNwbGl0KCQwLCBhcnJheSwgIiAiKTsgbmV3PSQx
+OyBmb3IoaT0xO2k8PW47aSsrKXsgaWYoIG5ldyE9JChpKzEpICl7IHByaW50IG5ldzsgbmV3PSQo
+aSsxKX19fScpICkKICBmb3IgdXNyIGluICIke19sb2dkX3VzZXJzW0BdfSI7IGRvCiAgICAgIHVt
+ZXNzLnNoIC11ICIke3Vzcn0iIC1tICIke3NlbmRfbWVzc2FnZX0iCiAgZG9uZQoKZmkK
+
+/etc/default/docker_user_default
+I1RlbXBsYXRlIGZpbGUgZm9yIGRvY2tlcl91c2VyIHNldHRpbmdzLiAKI1RoaXMgZmlsZSB3aWxs
+IGJlIHVzZWQgb25seSBvbmNlIHBlciBmaXJzdCBzdGFydCBvZiBkb2NrZXJfdXNlciBzZXJ2aWNl
+CiNhbmQgc2V0IHBhdGggdG8gc3RvcmFnZSBpbiB1c2VyIHJlbGF0ZWQgc2V0dGluZ3MuCkVYVF9N
+T1VOVF9ET0NLRVJfU1RPUkFHRT0iL21udC9uYXNfcmFpZDEwLyRfVVNFUi9pbWFnZXMvZG9ja2Vy
+L2RvY2tlcl9pbWdzX3N0b3JhZ2UucWVtdXJhd2ltZyI7IApET0NLRVJfT1BUUz0iLS1kbnMgMTAu
+NTQuMTMuMiAtLWRucyA4LjguNC40IC1nICR7UlVOVElNRV9GT0xERVJfSU1BR0VTfSAke0NPTV9T
+T0NLRVR9IC1wICR7T1BUX0ZPTERFUn0vZG9ja2VyLnBpZCAtLWV4ZWMtcm9vdD0ke09QVF9GT0xE
+RVJ9L2V4ZWNyb290ICI=
+
+/lib/systemd/system/docker_user_prep.sh
+IyEvYmluL2Jhc2gKIz09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09
+PT09PT09PT09PT09PT09PT09PT09PT09CiMgTkFNRSAgICAgIDogICBkb2NrZXJfdXNlcl9wcmVw
+LnNoCiMgQVVUSE9SICAgIDogICBBbmRyeXMgSmlyaQojIERBVEUgICAgICA6ICAgMjAxNy4wMS4w
+NQojIFZFUlNJT04gICA6ICAgMC4yCiMKIyBERVBFTkRFTkNJRVM6CiMgICAgICAgICAgICAgICAx
+KSBFeGVjdXRhYmxlczogYmFzaCwgZWNobywgbWtkaXIsIGNobW9kLCBjaG93biwgCiMgICAgICAg
+ICAgICAgICAgICAgICAgICAgICAgICAgeW1vdW50LCB1bWVzcy5zaAojCiMgICAgICAgICAgICAg
+ICAyKSBQYXJ0IG9mIGRvY2tlcl91c2VyX3ByZXBALnNlcnZpY2UsIGRvY2tlcl91c2VyQHNlcnZp
+Y2UKIwojCiMgREVTQ1JJUFRJT046CiMgICAgICAgICAgICAgUHJlcGFyaW5nIHNldHRpbmdzLCAK
+IyAgICAgICAgICAgICBjcmVhdGluZyBmaWxlcyBhbmQgY29uZmlndXJlcyBkb2NrZXJfdXNlckBz
+ZXJ2aWNlIGVudmlyb25tZW50CiMKIyAgICAgICAgICAgICAxKUlmIHRlbXBsYXRlIGZpbGUKIyAg
+ICAgICAgICAgICAgIChPUFRfRk9MREVSX1RFTVBMQVRFPS9ldGMvZGVmYXVsdC9kb2NrZXJfdXNl
+cl9kZWZhdWx0KSBkb2VzIG5vdCBleGlzdHMKIyAgICAgICAgICAgICBkdXJpbmcgZmlyc3QgcnVu
+KGZvciBldmVyeSB1c2VyKSwgc2NyaXB0IHByZXBhcmUgYW5kIHNldCB1c2VyIHNldHRpbmcgZnJv
+bSBkZWZhdWx0IAojICAgICAgICAgICAgIHZhbHVlcyBpbiBzY3JpcHQgdmFycyBURU1QTEFURV9B
+RERfRE9DS0VSLCBURU1QTEFURV9BRERfTU9VTlQKIwojICAgICAgICAgICAgIDIpSWYgdGVtcGxh
+dGUgZmlsZQojICAgICAgICAgICAgICAgKE9QVF9GT0xERVJfVEVNUExBVEU9L2V0Yy9kZWZhdWx0
+L2RvY2tlcl91c2VyX2RlZmF1bHQpIGRvZXMgZXhpc3RzCiMgICAgICAgICAgICAgZHVyaW5nIGZp
+cnN0IHJ1bihmb3IgZXZlcnkgdXNlciksIHNjcmlwdCBzb3VyY2UgdGVtcGxhdGUgZmlsZSBhbmQK
+IyAgICAgICAgICAgICBhbmQgd3JpdGUgcmVzdWx0cyBvZiB2YXJpYWJsZXMgRVhUX01PVU5UX0RP
+Q0tFUl9TVE9SQUdFLCBET0NLRVJfT1BUUwojICAgICAgICAgICAgIHRvIHVzZXIgc2V0dGluZ3Mg
+JHtPUFRfRk9MREVSfS9kb2NrZXIKIwojICAgICAgICAgICAgIEFuIEVYVF9NT1VOVF9ET0NLRVJf
+U1RPUkFHRSB2YXJpYWJsZSBjb250YWlucyBpbWFnZSB3aGVyZSBkb2NrZXIgc2F2ZSBpdHMgaW1h
+Z2VzCiMgICAgICAgICAgICAgQW4gRE9DS0VSX09QVFMgdmFyaWFibGUgY29udGFpbnMgcGFyYW1l
+dGVycyBmb3IgZG9ja2VyZCAKIwojVE9ETzpyZW1vdmUgdGVwbGF0ZV9maWxlIHZhbHVlcyBmcm9t
+IHRoaXMgc2NyaXB0CiMKIz09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09
+PT09PT09PT09PT09PT09PT09PT09PT09PT09CgoKCgpwcmVwZW52KCkgewoKICAjZmlyc3QgdGlt
+ZSBzZXR0aW5ncwogIGlmIFsgISAtZSAiJHtPUFRfRk9MREVSfS9kb2NrZXIiIF07IHRoZW4KICAg
+IGVjaG8gLWUgIlxuXG4iID4+IiR7SE9NRX0vLmJhc2hyYyIKICAgIGVjaG8gLWUgIiR7QkFTSFJD
+X0FERH0iID4+IiR7SE9NRX0vLmJhc2hyYyIKCiAgICBta2RpciAtcCAiJHtPUFRfRk9MREVSfS9l
+eGVjcm9vdCIKCiAgICBpZiBbICEgLWUgIiR7T1BUX0ZPTERFUl9URU1QTEFURX0iIF07IHRoZW4K
+ICAgICAgZWNobyAiJHtURU1QTEFURV9BRERfRE9DS0VSfSIgPj4iJE9QVF9GT0xERVIvZG9ja2Vy
+IgogICAgICBlY2hvICIke1RFTVBMQVRFX0FERF9NT1VOVH0iID4+IiRPUFRfRk9MREVSL2RvY2tl
+ciIKICAgIGVsc2UKICAgICAgI3JlYWQgdGVwbGF0ZSBhbmQgYWRkIHJlc3VsdCAKICAgICAgc291
+cmNlICIke09QVF9GT0xERVJfVEVNUExBVEV9IgogICAgICBlY2hvIEVYVF9NT1VOVF9ET0NLRVJf
+U1RPUkFHRT0nIiciJHtFWFRfTU9VTlRfRE9DS0VSX1NUT1JBR0V9IiciJyA+PiIke09QVF9GT0xE
+RVJ9L2RvY2tlciIKICAgICAgZWNobyBET0NLRVJfT1BUUz0nIiciJHtET0NLRVJfT1BUU30iJyIn
+ID4+IiR7T1BUX0ZPTERFUn0vZG9ja2VyIgogICAgZmkKCiAgICBjaG1vZCA3NzUgLVIgIiR7T1BU
+X0ZPTERFUn0iCiAgICBjaG93biAiJHtfVVNFUn0iOiIke19VU0VSfSIgLVIgIiR7T1BUX0ZPTERF
+Un0iCiAgICBjaG93biA6cm9vdCAiJHtPUFRfRk9MREVSfS9leGVjcm9vdCIKICAgIGNobW9kIDc3
+NyAiJHtPUFRfRk9MREVSfS9leGVjcm9vdCIKICAgIAogICAgI2NyZWF0ZSBmb2xkZXIgZm9yIG92
+ZXJsYXkgaW1hZ2UgRVhUX01PVU5UX0RPQ0tFUl9TVE9SQUdFCiAgICAjbWtkaXIgLXAgJHtFWFRf
+TU9VTlRfRE9DS0VSX1NUT1JBR0UlLyp9CiAgICAKICBmaQp9CgptbnRkb2NpbWcoKSB7CgogICNU
+T0RPOiBzZWMgaXNzdWUKICAjLiAiJHtPUFRfRk9MREVSfS9kb2NrZXIiCiAgI2V4dHJhY3Rpb24g
+b2YgdmFycyBmcm9tIHVzZXIncyBjb25maWcgZmlsZQogIEVYVF9NT1VOVF9ET0NLRVJfU1RPUkFH
+RT0kKGF3ayAne3Zhcm5hbWU9IkVYVF9NT1VOVF9ET0NLRVJfU1RPUkFHRT0iO2lmKGluZGV4KCQw
+LHZhcm5hbWUpKXtibGE9JDA7c3ViKHZhcm5hbWUsIiIsYmxhKTtnc3ViKCJcIiIsIiIsYmxhKTtw
+cmludCBibGEgfSAgICB9JyAiJHtPUFRfRk9MREVSfS9kb2NrZXIiICkKICBET0NLRVJfT1BUUz0k
+KGF3ayAne3Zhcm5hbWU9IkRPQ0tFUl9PUFRTPSI7aWYoaW5kZXgoJDAsdmFybmFtZSkpe2JsYT0k
+MDtzdWIodmFybmFtZSwiIixibGEpO2dzdWIoIlwiIiwiIixibGEpO3ByaW50IGJsYSB9ICAgIH0n
+ICIke09QVF9GT0xERVJ9L2RvY2tlciIgKQoKICByZXQ9IiIKICBlY2hvICJkb2NrZXJfdXNlcl9w
+cmVwOiBleHRfbW91bnRfZG9ja2VyX3N0b3JhZ2U9JEVYVF9NT1VOVF9ET0NLRVJfU1RPUkFHRSIK
+CiAgaWYgWyAhIC1kICIke1JVTlRJTUVfRk9MREVSX0lNQUdFU30iIF07IHRoZW4KICAgICNJcyBk
+b2NrZXIgc3RvcmFnZSBhdmFpbGFibGUsIGhhZCBiZWVuIG1vdW50ZWQgYmVmb3JlID8gPiBObyA+
+IG1vdW50IGRvY2tlciBzdG9yYWdlKGRvY2tlcmQgLWcpOgogICAgaWYgWyAtZiAiJHtFWFRfTU9V
+TlRfRE9DS0VSX1NUT1JBR0V9IiBdOyB0aGVuCiAgICAjZG9lcyBkb2NrZXItaW1hZ2UgZm9yIHN0
+b3JpbmcgZG9ja2VyIGltYWdlcyBleGlzdCA/ID4gWWVzID4gbW91bnQgdG8gL21udC8kVVNFUi92
+ZDIgCiAgICAgIHltb3VudCAtbiAtaT0iJHtkb2NrZXJtbnRwb2ludGlkfSIgLS11c2VyPSIke19V
+U0VSfSIgLW09IiR7RVhUX01PVU5UX0RPQ0tFUl9TVE9SQUdFfSIKICAgICAgX3JldD0iJD8iCiAg
+ICBmaQogIGZpCiAgaWYgWyAiJF9yZXQiICE9ICIwIiBdOyB0aGVuCiAgICBlY2hvICJFcnJvcjog
+UGxlYXNlIG1vdW50IGltYWdlIHRvIiIke1JVTlRJTUVfRk9MREVSX0lNQUdFU30gYnkgZm9sbG93
+aW5nIGNvbW1hbmQiCiAgICBlY2hvICIgICAgICAgJCB5bW91bnQgLW4gLWk9JHtkb2NrZXJtbnRw
+b2ludGlkfSIKICAgIHVtZXNzLnNoIC11ICIkX1VTRVIiIC1tICJFcnJvcjogUGxlYXNlIG1vdW50
+IGltYWdlIHRvIiIke1JVTlRJTUVfRk9MREVSX0lNQUdFU30gYnkgZm9sbG93aW5nIGNvbW1hbmQ6
+IFxuICAgICAgICQgeW1vdW50IC1uIC1pPSR7ZG9ja2VybW50cG9pbnRpZH0gXG4iCiAgICBleGl0
+ICIke19yZXR9IgogIGZpCn0KCm1haW4oKSB7CiAgX1VTRVI9IiQxIjsgZXhwb3J0IF9VU0VSCiAg
+X0FDVElPTj0iJDIiCgogIHltb3VudF9zZXR0aW5nc19hcnI9KCAkKC91c3IvbG9jYWwvYmluL3lt
+b3VudCBzZXR0aW5ncykgKQogIGV2YWwgIiR7eW1vdW50X3NldHRpbmdzX2FycltAXX0iCgogICgo
+ZG9ja2VybW50cG9pbnRpZD0ke1VTRVJfTE9PUERFVl9NQVh9LTEpKQogIGV4cG9ydCBkb2NrZXJt
+bnRwb2ludGlkCgogIEhPTUU9JChhd2sgLXYgY3Vzcj0kX1VTRVIgJ0JFR0lOe0ZTPSI6In17aWYo
+bWF0Y2goJDEsY3Vzcikpe3ByaW50ICQ2fX0nIC9ldGMvcGFzc3dkKQogIGV4cG9ydCBIT01FCgog
+IE9QVF9GT0xERVI9IiR7SE9NRX0vLmNvbmZpZy9kb2NrZXJfdXNlciI7IGV4cG9ydCBPUFRfRk9M
+REVSCgogIE9QVF9GT0xERVJfVEVNUExBVEU9L2V0Yy9kZWZhdWx0L2RvY2tlcl91c2VyX2RlZmF1
+bHQ7IGV4cG9ydCBPUFRfRk9MREVSX1RFTVBMQVRFCgogIFJVTlRJTUVfRk9MREVSX0lNQUdFUz0i
+L21udC8kX1VTRVIvdmQkZG9ja2VybW50cG9pbnRpZC9kb2NrZXIiOyBleHBvcnQgUlVOVElNRV9G
+T0xERVJfSU1BR0VTCgogIENPTV9TT0NLRVQ9Ii1IIHVuaXg6Ly8ke09QVF9GT0xERVJ9L2RvY2tl
+ci5zb2NrIjsgZXhwb3J0IENPTV9TT0NLRVQKCkJBU0hSQ19BREQ9IlwKCmRvY2tlcl91c2VyKCkg
+ewogIHBhcmFtcz1cIlwkQFwiCiAgLiBcIlwkSE9NRS8uY29uZmlnL2RvY2tlcl91c2VyL2RvY2tl
+clwiCiAgRE9DS0VSX1NPQ0tFVD1cJChwcmludGYgXCIlc1wiIFwiXCRET0NLRVJfT1BUU1wiIHwg
+Z3JlcCAtb1AgLWUgJygtSHwtLWhvc3QpXFcqXEsoXFMrKScpCiAgcGFyYW1zPVwiLUhcIlwiIFwi
+XCJcJHtET0NLRVJfU09DS0VUfVwiXCIgXCJcJHtwYXJhbXN9CiAgZG9ja2VyIFwke3BhcmFtc30K
+fQpleHBvcnQgLWYgZG9ja2VyX3VzZXIKIgpleHBvcnQgQkFTSFJDX0FERAoKICBpZiBbICEgLWUg
+IiR7T1BUX0ZPTERFUl9URU1QTEFURX0iIF07IHRoZW4KICAgIFRFTVBMQVRFX0FERF9ET0NLRVI9
+IkRPQ0tFUl9PUFRTPVwiLS1kbnMgOC44LjguOCAtLWRucyA4LjguNC40IC1nICR7UlVOVElNRV9G
+T0xERVJfSU1BR0VTfSAke0NPTV9TT0NLRVR9IC1wICR7T1BUX0ZPTERFUn0vZG9ja2VyLnBpZCAt
+LWV4ZWMtcm9vdD0ke09QVF9GT0xERVJ9L2V4ZWNyb290IFwiIgogICAgZXhwb3J0IFRFTVBMQVRF
+X0FERF9ET0NLRVIKICAgIFRFTVBMQVRFX0FERF9NT1VOVD0iRVhUX01PVU5UX0RPQ0tFUl9TVE9S
+QUdFPS9tbnQvbmFzX3JhaWQxMC8kX1VTRVIvaW1hZ2VzL2RvY2tlci9kb2NrZXJfaW1nc19zdG9y
+YWdlLnFlbXVyYXdpbWciOyAKICAgIGV4cG9ydCBURU1QTEFURV9BRERfTU9VTlQKICBmaQoKICBl
+Y2hvICJkb2NrZXJfdXNlcl9wcmVwOiBhY3Rpb249JF9BQ1RJT04iCiAgZWNobyAiZG9ja2VyX3Vz
+ZXJfcHJlcDogdXNlcj0kX1VTRVIiCiAgZWNobyAiZG9ja2VyX3VzZXJfcHJlcDogaG9tZT0kSE9N
+RSIKICBlY2hvICJkb2NrZXJfdXNlcl9wcmVwOiBvcHRfZm9sZGVyPSRPUFRfRk9MREVSIgogIGVj
+aG8gImRvY2tlcl91c2VyX3ByZXA6IG9wdF9mb2xkZXJfdGVtcGxhdGU9JE9QVF9GT0xERVJfVEVN
+UExBVEUiCiAgZWNobyAiZG9ja2VyX3VzZXJfcHJlcDogcnVudGltZV9mb2xkZXJfaW1hZ2VzPSRS
+VU5USU1FX0ZPTERFUl9JTUFHRVMiCiAgZWNobyAiZG9ja2VyX3VzZXJfcHJlcDogZG9ja2VyX21u
+dHBvaW50aWQ9JGRvY2tlcm1udHBvaW50aWQiCiAgZWNobyAiZG9ja2VyX3VzZXJfcHJlcDogdGVt
+cGxhdGVfYWRkX2RvY2tlcj0kVEVNUExBVEVfQUREX0RPQ0tFUiIKICBlY2hvICJkb2NrZXJfdXNl
+cl9wcmVwOiB0ZW1wbGF0ZV9hZGRfbW91bnQ9JFRFTVBMQVRFX0FERF9NT1VOVCIKCiAgaWYgWyAi
+JF9BQ1RJT04iID09ICJzdGFydCIgXTsgdGhlbgogICAgcHJlcGVudgogICAgbW50ZG9jaW1nCiAg
+ZWxpZiAgWyAiJF9BQ1RJT04iID09ICJ1bm1vdW50IiBdOyB0aGVuCiAgICAjVE9ETzogc2VjIGlz
+c3VlCiAgICAjLiAiJE9QVF9GT0xERVIvZG9ja2VyIgogICAgI2V4dHJhY3Rpb24gb2YgdmFycyBm
+cm9tIHVzZXIncyBjb25maWcgZmlsZQogICAgRVhUX01PVU5UX0RPQ0tFUl9TVE9SQUdFPSQoYXdr
+ICd7dmFybmFtZT0iRVhUX01PVU5UX0RPQ0tFUl9TVE9SQUdFPSI7aWYoaW5kZXgoJDAsdmFybmFt
+ZSkpe2JsYT0kMDtzdWIodmFybmFtZSwiIixibGEpO2dzdWIoIlwiIiwiIixibGEpO3ByaW50IGJs
+YSB9ICAgIH0nICIke09QVF9GT0xERVJ9L2RvY2tlciIgKQogICAgRE9DS0VSX09QVFM9JChhd2sg
+J3t2YXJuYW1lPSJET0NLRVJfT1BUUz0iO2lmKGluZGV4KCQwLHZhcm5hbWUpKXtibGE9JDA7c3Vi
+KHZhcm5hbWUsIiIsYmxhKTtnc3ViKCJcIiIsIiIsYmxhKTtwcmludCBibGEgfSAgICB9JyAiJHtP
+UFRfRk9MREVSfS9kb2NrZXIiICkKCiAgICB1bWVzcy5zaCAtdSAiJF9VU0VSIiAtbSAiSW5mbzog
+VW4tbW91bnRpbmcgZG9ja2VyIGltYWdlIFsvbW50LyRfVVNFUi92ZCR7ZG9ja2VybW50cG9pbnRp
+ZH06IFxuICAgICAgICAkIHltb3VudCB1bm1vdW50IC1uIC1pPSR7ZG9ja2VybW50cG9pbnRpZH1c
+biIKICAgIHltb3VudCB1bm1vdW50IC0tdXNlcj0iJF9VU0VSIiAtaT0iJHtkb2NrZXJtbnRwb2lu
+dGlkfSIKICAgIF9yZXQxPSQ/CiAgICBpZiBbICIke19yZXQxfSIgIT0gIjAiIF07IHRoZW4KICAg
+ICAgdW1lc3Muc2ggLXUgIiRfVVNFUiIgLW0gIkVycm9yOiBVbi1tb3VudGluZyAvbW50LyRfVVNF
+Ui92ZCR7ZG9ja2VybW50cG9pbnRpZH0gISEgXG4iCiAgICAgIGV4aXQgIiR7X3JldDF9IgogICAg
+ZWxzZQogICAgICB1bWVzcy5zaCAtdSAiJF9VU0VSIiAtbSAiSW5mbzogVW4tbW91bnRpbmcgL21u
+dC8kX1VTRVIvdmQke2RvY2tlcm1udHBvaW50aWR9IDogT0sgXG4iCiAgICAgIGV4aXQgIiR7X3Jl
+dDF9IgogICAgZmkKICBmaQoKfQoKCiNDaGVjayB1c2VyIGV4aXN0ZW5jZSBpbiBwYXJhbWF0ZXIg
+MQppZCAiJDEiIHx8IGV4aXQgMQoKbWFpbiAiJDEiICIkMiIK
+
+/lib/systemd/system/docker_user_prep@.service
+W1VuaXRdCkRlc2NyaXB0aW9uPUdlbmVyYXRlcyBzZXR0aW5ncyBhbmQgZW52IGZvciBkb2NrZXJf
+dXNlckAuc2VydmljZQpCaW5kc1RvPWRvY2tlcl91c2VyQCVpLnNlcnZpY2UKQWZ0ZXI9bmV0d29y
+ay50YXJnZXQKUmVxdWlyZXM9bmV0d29yay50YXJnZXQKI0FmdGVyPW1udC1uYXNfcmFpZDEwLXNo
+YXJlLm1vdW50CiNSZXF1aXJlcz1tbnQtbmFzX3JhaWQxMC1zaGFyZS5tb3VudAoKW1NlcnZpY2Vd
+ClR5cGU9b25lc2hvdApSZW1haW5BZnRlckV4aXQ9eWVzCkV4ZWNTdGFydD0vYmluL3NoIC1jICIv
+bGliL3N5c3RlbWQvc3lzdGVtL2RvY2tlcl91c2VyX3ByZXAuc2ggJWkgc3RhcnQiCkV4ZWNTdG9w
+PS9iaW4vc2ggLWMgIi9saWIvc3lzdGVtZC9zeXN0ZW0vZG9ja2VyX3VzZXJfcHJlcC5zaCAlaSB1
+bm1vdW50IgoK
+
+/lib/systemd/system/docker_user@.socket
+W1VuaXRdCkRlc2NyaXB0aW9uPURvY2tlciBTb2NrZXQgZm9yIHRoZSBBUEkKUGFydE9mPWRvY2tl
+cl91c2VyQCVpLnNlcnZpY2UKCltTb2NrZXRdCkVudmlyb25tZW50RmlsZT0vaG9tZS8laS8uY29u
+ZmlnL2RvY2tlcl91c2VyL2RvY2tlcgpMaXN0ZW5TdHJlYW09L2hvbWUvJWkvLmNvbmZpZy9kb2Nr
+ZXJfdXNlci9kb2NrZXIuc29jawpTb2NrZXRNb2RlPTA2NjAKU29ja2V0VXNlcj1yb290ClNvY2tl
+dEdyb3VwPWRvY2tlcgoKW0luc3RhbGxdCldhbnRlZEJ5PXNvY2tldHMudGFyZ2V0Cg==
+
+/lib/systemd/system/docker_user@.service
+W1VuaXRdCkRlc2NyaXB0aW9uPURvY2tlciBBcHBsaWNhdGlvbiBDb250YWluZXIgRW5naW5lLk11
+bHRpcGxlIHVzZXIgc3VwcG9ydC4KRG9jdW1lbnRhdGlvbj1odHRwczovL2RvY3MuZG9ja2VyLmNv
+bQpBZnRlcj1uZXR3b3JrLnRhcmdldCBkb2NrZXJfdXNlckAlaS5zb2NrZXQKUmVxdWlyZXM9ZG9j
+a2VyX3VzZXJAJWkuc29ja2V0CkFmdGVyPWRvY2tlcl91c2VyX3ByZXBAJWkuc2VydmljZQpSZXF1
+aXJlcz1kb2NrZXJfdXNlcl9wcmVwQCVpLnNlcnZpY2UKCltTZXJ2aWNlXQpUeXBlPW5vdGlmeQoj
+IHRoZSBkZWZhdWx0IGlzIG5vdCB0byB1c2Ugc3lzdGVtZCBmb3IgY2dyb3VwcyBiZWNhdXNlIHRo
+ZSBkZWxlZ2F0ZSBpc3N1ZXMgc3RpbGwKIyBleGlzdHMgYW5kIHN5c3RlbWQgY3VycmVudGx5IGRv
+ZXMgbm90IHN1cHBvcnQgdGhlIGNncm91cCBmZWF0dXJlIHNldCByZXF1aXJlZAojIGZvciBjb250
+YWluZXJzIHJ1biBieSBkb2NrZXIKRW52aXJvbm1lbnRGaWxlPS9ob21lLyVpLy5jb25maWcvZG9j
+a2VyX3VzZXIvZG9ja2VyCkV4ZWNTdGFydD0vdXNyL2Jpbi9kb2NrZXJkICAkRE9DS0VSX09QVFMK
+RXhlY1JlbG9hZD0vYmluL2tpbGwgLXMgSFVQICRNQUlOUElECiMgSGF2aW5nIG5vbi16ZXJvIExp
+bWl0cyBjYXVzZXMgcGVyZm9ybWFuY2UgcHJvYmxlbXMgZHVlIHRvIGFjY291bnRpbmcgb3Zlcmhl
+YWQKIyBpbiB0aGUga2VybmVsLiBXZSByZWNvbW1lbmQgdXNpbmcgY2dyb3VwcyB0byBkbyBjb250
+YWluZXItbG9jYWwgYWNjb3VudGluZy4KTGltaXROT0ZJTEU9aW5maW5pdHkKTGltaXROUFJPQz1p
+bmZpbml0eQpMaW1pdENPUkU9aW5maW5pdHkKIyBVbmNvbW1lbnQgVGFza3NNYXggaWYgeW91ciBz
+eXN0ZW1kIHZlcnNpb24gc3VwcG9ydHMgaXQuCiMgT25seSBzeXN0ZW1kIDIyNiBhbmQgYWJvdmUg
+c3VwcG9ydCB0aGlzIHZlcnNpb24uClRhc2tzTWF4PWluZmluaXR5ClRpbWVvdXRTdGFydFNlYz0w
+CiMgc2V0IGRlbGVnYXRlIHllcyBzbyB0aGF0IHN5c3RlbWQgZG9lcyBub3QgcmVzZXQgdGhlIGNn
+cm91cHMgb2YgZG9ja2VyIGNvbnRhaW5lcnMKRGVsZWdhdGU9eWVzCiMga2lsbCBvbmx5IHRoZSBk
+b2NrZXIgcHJvY2Vzcywgbm90IGFsbCBwcm9jZXNzZXMgaW4gdGhlIGNncm91cApLaWxsTW9kZT1w
+cm9jZXNzCgpbSW5zdGFsbF0KV2FudGVkQnk9bXVsdGktdXNlci50YXJnZXQK
+
+/lib/systemd/system/mounts_disconects@.service
+W1VuaXRdCkRlc2NyaXB0aW9uPVN0b3BzIGFsbCBkb2NrZXJfdXNlciBjb250YWluZXJzKGRvY2tl
+cl91c2VyQCouc2VydmljZXMpLCBkaXNjb25uZWN0cyBhbGwgbW91bnRzIGZyb20gcmFpZC4KCltT
+ZXJ2aWNlXQpUeXBlPW9uZXNob3QKRXhlY1N0YXJ0PS9iaW4vc2ggLWMgInN5c3RlbWN0bCBzdG9w
+IGRvY2tlcl91c2VyQCVpLnNlcnZpY2UiCkV4ZWNTdGFydD0vYmluL3NoIC1jICJzbGVlcCA1IgpF
+eGVjU3RhcnQ9LS9iaW4vc2ggLWMgInltb3VudCB1bm1vdW50IC0tdXNlcj0laSAtLXVubW91bnQt
+YWxsIgoKW0luc3RhbGxdCldhbnRlZEJ5PWRlZmF1bHQudGFyZ2V0Cg==
+
+/lib/systemd/system/mounts_disconects@.timer
+W1VuaXRdCkRlc2NyaXB0aW9uPVN0b3BzIGFsbCBkb2NrZXJfdXNlciBjb250YWluZXJzKGRvY2tl
+cl91c2VyQCouc2VydmljZXMpLCBkaXNjb25uZWN0cyBhbGwgbW91bnRzIGZyb20gcmFpZC4KCltU
+aW1lcl0KT25DYWxlbmRhcj0qLSotKiAyMjo0NTowMAoKW0luc3RhbGxdCldhbnRlZEJ5PXRpbWVy
+cy50YXJnZXQK
+
+/home/$USER_NAME_HOST/.config/yocto_docker/build_0.1/ubuntu14045_yocto_base.v5.docker
+IyA9PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09
+PT09PT09PT0KIyBOQU1FICAgICAgOiAgIHVidW50dTE0MDQ1X3lvY3RvX2Jhc2UudjUuZG9ja2Vy
+CiMgQVVUSE9SICAgIDogICBBbmRyeXMgSmlyaQojCiMgREVQRU5ERU5DSUVTOgojICAgICAgICAg
+ICAgICAgMSkgQmluYXJpZXM6IFVidW50dSAxNC4wNC41LC4uLgojCiMgREVTQ1JJUFRJT046CiMg
+ICAgICAgICAgICAgRG9ja2VyIGZpbGUgZm9yIFlvY3RvCiMgCiMgPT09PT09PT09PT09PT09PT09
+PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0KRlJPTSB1YnVudHU6
+MTQuMDQuNQpNQUlOVEFJTkVSIEFuZHJ5cyBKaXJpICJhbmRyeXMuamlyaStwcm9qZWN0X3lvY3Rv
+X2RvY2tlckBnbWFpbC5jb20iCgpMQUJFTCBOYW1lPSJ1YnVudHUxNDA0NV95b2N0b19iYXNlLnY1
+LmRvY2tlciIgXAogICAgICBBdXRob3I9IkFuZHJ5cyBKaXJpIiBcCiAgICAgIERhdGU9IjIwMTcu
+MTIuMjEiIFwKICAgICAgVmVyc2lvbj0iMC41IiBcCiAgICAgIERlc2NyaXB0aW9uPSJFbnZpcm9u
+bWVudCB3aGljaCBpbmNsdWRlcyBiYXNpYyBkZXBlbmRlbmNpZXMgZm9yIFlvY3RvIgoKClJVTiBh
+cHQtZ2V0IHVwZGF0ZQoKI3sgWW9jdG8gZGVwZW5kZW5jaWVzClJVTiBhcHQtZ2V0IGluc3RhbGwg
+LXkgcHl0aG9uIHB5dGhvbi1waXAgd2dldCBcCiAgICAgICAgICAgICAgICAgICAgICAgZ2F3ayBn
+aXQtY29yZSBkaWZmc3RhdCB1bnppcCB0ZXhpbmZvIGdjYy1tdWx0aWxpYiBcCiAgICAgICAgICAg
+ICAgICAgICAgICAgYnVpbGQtZXNzZW50aWFsIGNocnBhdGggc29jYXQgZ2NjIHB5dGhvbiBuYW5v
+IGN1cmwgXAogICAgICAgICAgICAgICAgICAgICAgIHh0ZXJtIHFlbXUtdXRpbHMga3BhcnR4IGxp
+YnNkbDEuMi1kZXYgZG9zMnVuaXggbGFuZ3VhZ2UtcGFjay1lbi1iYXNlCiN9CgojeyBSZXBvIHRv
+b2wKUlVOIGN1cmwgaHR0cDovL2NvbW1vbmRhdGFzdG9yYWdlLmdvb2dsZWFwaXMuY29tL2dpdC1y
+ZXBvLWRvd25sb2Fkcy9yZXBvID4vdXNyL2xvY2FsL2Jpbi9yZXBvICYmIFwKICAgIGNobW9kIGEr
+cnd4IC91c3IvbG9jYWwvYmluL3JlcG8g
+
+/home/$USER_NAME_HOST/.config/yocto_docker/build_0.1/ubuntu14045_yocto_user.v3.docker
+IyA9PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09
+PT09PT09PT0KIyBOQU1FICAgICAgOiAgIHVidW50dTE0MDQ1X3lvY3RvX3VzZXIudjMuZG9ja2Vy
+CiMgQVVUSE9SICAgIDogICBBbmRyeXMgSmlyaQojCiMgREVQRU5ERU5DSUVTOgojICAgICAgICAg
+ICAgICAgMSkgQmluYXJpZXM6IFVidW50dSAxNC4wNAojCiMgREVTQ1JJUFRJT046CiMgICAgICAg
+ICAgICAgWW9jdG8gZG9ja2VyIGZpbGUuCiMgCiMgPT09PT09PT09PT09PT09PT09PT09PT09PT09
+PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0KRlJPTSBnYW5kcnlzL3VidW50dTE0
+MDQ1X3lvY3RvX2Jhc2U6djUKTUFJTlRBSU5FUiBBbmRyeXMgSmlyaSAiYW5kcnlzLmppcmkrcHJv
+amVjdF95b2N0b19kb2NrZXJAZ21haWwuY29tIgoKTEFCRUwgTmFtZT0idWJ1bnR1MTQwNDVfeW9j
+dG9fdXNlci52My5kb2NrZXIiIFwKICAgICAgQXV0aG9yPSJBbmRyeXMgSmlyaSIgXAogICAgICBE
+YXRlPSIyMDE3LjEyLjIxIiBcCiAgICAgIFZlcnNpb249IjAuMyIgXAogICAgICBEZXNjcmlwdGlv
+bj0iWW9jdG8gZG9ja2VyIGZpbGUiCgoKI3sgVmFyaWFibGVzOiBkb2NrZXIgYnVpbGQgLS1idWls
+ZC1hcmcgPHZhcm5hbWU+PTx2YWx1ZT4gCkFSRyBVU0VSX05BTUUKQVJHIFVTRVJfVUlECkFSRyBV
+U0VSX0dJRAoKRU5WIFVTRVJfTkFNRT0iJHtVU0VSX05BTUV9IgpFTlYgVVNFUl9VSUQ9IiR7VVNF
+Ul9VSUR9IgpFTlYgVVNFUl9HSUQ9IiR7VVNFUl9HSUR9IgojfQoKI3sgQ3JlYXRlIG5ldyB1c2Vy
+IHdpdGggaWRlbnRpY2FsIHVzZXIgbmFtZSwgdWlkLCBnaWQgClJVTiBncm91cGFkZCAiJHtVU0VS
+X05BTUV9IiAtZyAiJHtVU0VSX0dJRH0iICYmIFwKICAgIHVzZXJhZGQgLW0gIiR7VVNFUl9OQU1F
+fSIgLXUgIiR7VVNFUl9VSUR9IiAtZyAke1VTRVJfR0lEfSAmJiBcCiAgICB1c2VybW9kIC1hRyBz
+dWRvICIke1VTRVJfTkFNRX0iClJVTiBlY2hvIHlvY3RvID4+dXNlcnBhc3N3b3JkOyBlY2hvIHlv
+Y3RvID4+dXNlcnBhc3N3b3JkOyBlY2hvICIiPj51c2VycGFzc3dvcmQ7IFwKICAgIGNhdCB1c2Vy
+cGFzc3dvcmQgfCBwYXNzd2QgIiR7VVNFUl9OQU1FfSIKI30KCiN7IENvcHkvRG93bmxvYWQgcmVw
+bwpSVU4gbWtkaXIgLXAgIi9ob21lLyR7VVNFUl9OQU1FfS9iaW4iICYmIFwKICAgIGNob3duICR7
+VVNFUl9OQU1FfToke1VTRVJfTkFNRX0gIi9ob21lLyR7VVNFUl9OQU1FfS9iaW4iCgpSVU4gY3Ag
+L3Vzci9sb2NhbC9iaW4vcmVwbyAvaG9tZS8ke1VTRVJfTkFNRX0vYmluLyAKCiNpZiB3ZSBkb3du
+bG9hZCBuZXcgcmVwbyBkZWxldGUgb2xkIHJlcG8gaW4gL3Vzci9sb2NhbC9iaW4vcmVwbwpSVU4g
+Y3VybCBodHRwOi8vY29tbW9uZGF0YXN0b3JhZ2UuZ29vZ2xlYXBpcy5jb20vZ2l0LXJlcG8tZG93
+bmxvYWRzL3JlcG8gPi9ob21lLyR7VVNFUl9OQU1FfS9iaW4vcmVwbyAmJiBybSAtZiAvdXNyL2xv
+Y2FsL2Jpbi9yZXBvIDsgZWNobyAiSWdub3JlIGVyciIgCgpSVU4gY2htb2QgYSt4IC9ob21lLyR7
+VVNFUl9OQU1FfS9iaW4vcmVwbyAmJiBcCiAgICBjaG93biAke1VTRVJfTkFNRX06JHtVU0VSX05B
+TUV9ICIvaG9tZS8ke1VTRVJfTkFNRX0vYmluL3JlcG8iCgpSVU4gZWNobyAiUEFUSD1cJFBBVEg6
+L2hvbWUvJHtVU0VSX05BTUV9L2JpbiIgPj4iL2hvbWUvJHtVU0VSX05BTUV9Ly5iYXNocmMiCiN9
+CgpSVU4gbG4gLXMgL29wdC8ke1VTRVJfTkFNRX0vd29ya3MvLmJhc2hfaGlzdG9yeSAvaG9tZS8k
+e1VTRVJfTkFNRX0vLmJhc2hfaGlzdG9yeQoKRU5WIExDX0FMTCBlbl9HQi5VVEYtOApFTlYgTEFO
+RyBlbl9HQi5VVEYtOAoKV09SS0RJUiAvb3B0LyR7VVNFUl9OQU1FfS93b3JrcwoKVVNFUiAke1VT
+RVJfTkFNRX0=
+
+/home/$USER_NAME_HOST/.config/yocto_docker/build_0.1/ubuntu1604_yocto_base.v1.docker
+IyA9PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09
+PT09PT09PT0KIyBOQU1FICAgICAgOiAgIHVidW50dTE2MDRfeW9jdG9fYmFzZS52MS5kb2NrZXIK
+IyBBVVRIT1IgICAgOiAgIEFuZHJ5cyBKaXJpCiMKIyBERVBFTkRFTkNJRVM6CiMgICAgICAgICAg
+ICAgICAxKSBCaW5hcmllczogVWJ1bnR1IDE2LjA0CiMKIyBERVNDUklQVElPTjoKIyAgICAgICAg
+ICAgICBEb2NrZXIgZmlsZSBmb3IgWW9jdG8KIyAKIyA9PT09PT09PT09PT09PT09PT09PT09PT09
+PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PQpGUk9NIHVidW50dToxNi4wNApN
+QUlOVEFJTkVSIEFuZHJ5cyBKaXJpICJhbmRyeXMuamlyaStwcm9qZWN0X3lvY3RvX2RvY2tlckBn
+bWFpbC5jb20iCgpMQUJFTCBOYW1lPSJ1YnVudHUxNjA0X3lvY3RvX2Jhc2UudjEuZG9ja2VyIiBc
+CiAgICAgIEF1dGhvcj0iQW5kcnlzIEppcmkiIFwKICAgICAgRGF0ZT0iMjAxOC4wMS4wOSIgXAog
+ICAgICBWZXJzaW9uPSIwLjEiIFwKICAgICAgRGVzY3JpcHRpb249IkVudmlyb25tZW50IHdoaWNo
+IGluY2x1ZGVzIGJhc2ljIGRlcGVuZGVuY2llcyBmb3IgWW9jdG8iCgoKUlVOIGFwdC1nZXQgdXBk
+YXRlCgojeyBZb2N0byBkZXBlbmRlbmNpZXMKUlVOIGFwdC1nZXQgaW5zdGFsbCAteSB3Z2V0IGdh
+d2sgZ2l0LWNvcmUgZGlmZnN0YXQgdW56aXAgdGV4aW5mbyBnY2MtbXVsdGlsaWIgXAogICAgICAg
+ICAgICAgICAgICAgICAgIGJ1aWxkLWVzc2VudGlhbCBjaHJwYXRoIHNvY2F0IGdjYyBsaWJzZGwx
+LjItZGV2IHh0ZXJtIGN1cmwgXAogICAgICAgICAgICAgICAgICAgICAgIGNwaW8KI30KCiN7SW4g
+ZG9ja2VyLXVidW50dTE2LjA0IGFyZSBtaXNzaW5nIHN1ZG8sIHB5dGhvbjMsIGxvY2FsZSwgcGFj
+a2FnZXMgClJVTiBhcHQtZ2V0IGluc3RhbGwgLXkgc3VkbyBjYS1jZXJ0aWZpY2F0ZXMgcGtnLWNv
+bmZpZyBcCiAgICBweXRob24zIHB5dGhvbjMtZGV2IHB5dGhvbjMtcGlwIGxhbmd1YWdlLXBhY2st
+ZW4tYmFzZSAmJiBcCiAgICBhcHQtZ2V0IHVwZ3JhZGUgLXkgIAojfQoKI3tEZXBlbmRlbmN5IGdp
+dmVuIGJ5IE5YUCBtZXRhLWxheWVycyAKUlVOIGFwdC1nZXQgaW5zdGFsbCAteSB1LWJvb3QtdG9v
+bHMKI30KCiNUb29scyBmb3IgbWFrZSB0aGluZ3MgZWFzaWVyIApSVU4gYXB0LWdldCBpbnN0YWxs
+IC15IG5hbm8gCgojU29tZSBsYXllcnMgZnJvbSBhcmUgdXNpbmcgcmVhbGx5IG9mdGVuIGZvbGxv
+d2luZyB0b29scyAKUlVOIGFwdC1nZXQgaW5zdGFsbCAteSBkb3MydW5peAoKCiNUb29scyBmb3Ig
+eW9jdG8tdG9vbHMKUlVOIGFwdC1nZXQgaW5zdGFsbCAteSBrcGFydHggcWVtdS11dGlscyAKCgoj
+Q2xlYW5pbmcgClJVTiBhcHQtZ2V0IGF1dG9yZW1vdmUgLXkgJiYgXAogICAgYXB0LWdldCBjbGVh
+biAmJiBcCiAgICBhcHQtZ2V0IGF1dG9jbGVhbiAmJiBcCiAgICBybSAtcmYgL3Zhci9jYWNoZS8q
+ICYmIFwKICAgIHJtIC1yZiAvdG1wLyogJiYgXAogICAgcm0gLXJmIC92YXIvdG1wLyogJiYgXAog
+ICAgcm0gLXJmIC92YXIvbGliL2FwdC9saXN0cy8qCgogICAgCiAgICAKI3sgUmVwbyB0b29sClJV
+TiBjdXJsIGh0dHA6Ly9jb21tb25kYXRhc3RvcmFnZS5nb29nbGVhcGlzLmNvbS9naXQtcmVwby1k
+b3dubG9hZHMvcmVwbyA+L3Vzci9sb2NhbC9iaW4vcmVwbyAmJiBcCiAgICBjaG1vZCBhK3J3eCAv
+dXNyL2xvY2FsL2Jpbi9yZXBvIAo=
+
+/home/$USER_NAME_HOST/.config/yocto_docker/build_0.1/ubuntu1604_yocto_user.v1.docker
+IyA9PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09
+PT09PT09PT0KIyBOQU1FICAgICAgOiAgIHVidW50dTE0MDQ1X3lvY3RvX3VzZXIudjIuZG9ja2Vy
+CiMgQVVUSE9SICAgIDogICBBbmRyeXMgSmlyaQojCiMgREVQRU5ERU5DSUVTOgojICAgICAgICAg
+ICAgICAgMSkgQmluYXJpZXM6IFVidW50dSAxNi4wNAojCiMgREVTQ1JJUFRJT046CiMgICAgICAg
+ICAgICAgWW9jdG8gZG9ja2VyIGZpbGUuCiMgCiMgPT09PT09PT09PT09PT09PT09PT09PT09PT09
+PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0KRlJPTSBnYW5kcnlzL3VidW50dTE2
+MDRfeW9jdG9fYmFzZTp2MQpNQUlOVEFJTkVSIEFuZHJ5cyBKaXJpICJhbmRyeXMuamlyaStwcm9q
+ZWN0X3lvY3RvX2RvY2tlckBnbWFpbC5jb20iCgpMQUJFTCBOYW1lPSJ1YnVudHUxNjA0X3lvY3Rv
+X3VzZXIudjEuZG9ja2VyIiBcCiAgICAgIEF1dGhvcj0iQW5kcnlzIEppcmkiIFwKICAgICAgRGF0
+ZT0iMjAxNy4xMi4yMSIgXAogICAgICBWZXJzaW9uPSIwLjEiIFwKICAgICAgRGVzY3JpcHRpb249
+IllvY3RvIGRvY2tlciBmaWxlIgoKCiN7IFZhcmlhYmxlczogZG9ja2VyIGJ1aWxkIC0tYnVpbGQt
+YXJnIDx2YXJuYW1lPj08dmFsdWU+IApBUkcgVVNFUl9OQU1FCkFSRyBVU0VSX1VJRApBUkcgVVNF
+Ul9HSUQKCkVOViBVU0VSX05BTUU9IiR7VVNFUl9OQU1FfSIKRU5WIFVTRVJfVUlEPSIke1VTRVJf
+VUlEfSIKRU5WIFVTRVJfR0lEPSIke1VTRVJfR0lEfSIKI30KCiN7IENyZWF0ZSBuZXcgdXNlciB3
+aXRoIGlkZW50aWNhbCB1c2VyIG5hbWUsIHVpZCwgZ2lkIApSVU4gZ3JvdXBhZGQgIiR7VVNFUl9O
+QU1FfSIgLWcgIiR7VVNFUl9HSUR9IiAmJiBcCiAgICB1c2VyYWRkIC1tICIke1VTRVJfTkFNRX0i
+IC11ICIke1VTRVJfVUlEfSIgLWcgJHtVU0VSX0dJRH0gJiYgXAogICAgdXNlcm1vZCAtYUcgc3Vk
+byAiJHtVU0VSX05BTUV9IgpSVU4gZWNobyB5b2N0byA+PnVzZXJwYXNzd29yZDsgZWNobyB5b2N0
+byA+PnVzZXJwYXNzd29yZDsgZWNobyAiIj4+dXNlcnBhc3N3b3JkOyBcCiAgICBjYXQgdXNlcnBh
+c3N3b3JkIHwgcGFzc3dkICIke1VTRVJfTkFNRX0iCiN9CgojeyBDb3B5L0Rvd25sb2FkIHJlcG8K
+UlVOIG1rZGlyIC1wICIvaG9tZS8ke1VTRVJfTkFNRX0vYmluIiAmJiBcCiAgICBjaG93biAke1VT
+RVJfTkFNRX06JHtVU0VSX05BTUV9ICIvaG9tZS8ke1VTRVJfTkFNRX0vYmluIgoKUlVOIGNwIC91
+c3IvbG9jYWwvYmluL3JlcG8gL2hvbWUvJHtVU0VSX05BTUV9L2Jpbi8gCgojaWYgd2UgZG93bmxv
+YWQgbmV3IHJlcG8gZGVsZXRlIG9sZCByZXBvIGluIC91c3IvbG9jYWwvYmluL3JlcG8KUlVOIGN1
+cmwgaHR0cDovL2NvbW1vbmRhdGFzdG9yYWdlLmdvb2dsZWFwaXMuY29tL2dpdC1yZXBvLWRvd25s
+b2Fkcy9yZXBvID4vaG9tZS8ke1VTRVJfTkFNRX0vYmluL3JlcG8gJiYgcm0gLWYgL3Vzci9sb2Nh
+bC9iaW4vcmVwbyA7IGVjaG8gIklnbm9yZSBlcnIiIAoKUlVOIGNobW9kIGEreCAvaG9tZS8ke1VT
+RVJfTkFNRX0vYmluL3JlcG8gJiYgXAogICAgY2hvd24gJHtVU0VSX05BTUV9OiR7VVNFUl9OQU1F
+fSAiL2hvbWUvJHtVU0VSX05BTUV9L2Jpbi9yZXBvIgoKUlVOIGVjaG8gIlBBVEg9XCRQQVRIOi9o
+b21lLyR7VVNFUl9OQU1FfS9iaW4iID4+Ii9ob21lLyR7VVNFUl9OQU1FfS8uYmFzaHJjIgojfQoK
+UlVOIGxuIC1zIC9vcHQvJHtVU0VSX05BTUV9L3dvcmtzLy5iYXNoX2hpc3RvcnkgL2hvbWUvJHtV
+U0VSX05BTUV9Ly5iYXNoX2hpc3RvcnkKCkVOViBMQ19BTEwgZW5fR0IuVVRGLTgKRU5WIExBTkcg
+ZW5fR0IuVVRGLTgKCldPUktESVIgL29wdC8ke1VTRVJfTkFNRX0vd29ya3MKClVTRVIgJHtVU0VS
+X05BTUV9
+

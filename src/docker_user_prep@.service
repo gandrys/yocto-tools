@@ -1,0 +1,14 @@
+[Unit]
+Description=Generates settings and env for docker_user@.service
+BindsTo=docker_user@%i.service
+After=network.target
+Requires=network.target
+#After=mnt-nas_raid10-share.mount
+#Requires=mnt-nas_raid10-share.mount
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c "/lib/systemd/system/docker_user_prep.sh %i start"
+ExecStop=/bin/sh -c "/lib/systemd/system/docker_user_prep.sh %i unmount"
+

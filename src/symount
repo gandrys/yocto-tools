@@ -1,0 +1,928 @@
+#!/bin/bash
+#====================================================================
+# NAME      :   ymount
+# AUTHOR    :   Andrys Jiri
+# DATE      :   2017.11.08
+# VERSION   :   0.2.5
+#
+# DEPENDENCIES:
+#               1) binaries: bash, grep, egrep, awk, mkdir, chmod, chown, 
+#                  losetup, kpartx, mount, id, smbstatus, smbcontrol
+#
+#               2) Path to Yocto image have to include username[xxxxxx] 
+#                  and image must have extention *.qemurawimg.
+#
+# DESCRIPTION:
+#             Script for mounting raw images with multi-user support.
+#             Without parameters, script will mount.
+#
+#
+#	Number of loop device is given by uid:
+#	 >first_loopdev_num=(uid-1000)*3
+#
+#	Every user have max 3 loop devices:
+#	 >uid=1000;first_loopdev_num=0;{0,1,2};
+#	 >uid=1001;first_loopdev_num=3;{3,4,5};
+#	 >uid=1002;first_loopdev_num=6;{6,7,8};
+#
+#	In order to access machine mounts easily by one cifs connection 
+#   and being able to work on multiple images at same time with less possible configuration,
+#   then every Yocto image is at first mounted to "/mnt/${user}/vdX" 
+#	and then that to "/opt/${user}/works"
+#
+#	Following folders have to exists in BuildMachine:
+#	>"/mnt/${user}/vd0", "/mnt/${user}/vd1", "/mnt/${user}/vd2"
+#	>"/opt/${user}/works"
+#
+#	Following folders have to exists in image due to secondary mount:
+#	>"/opt/${user}/works"
+#
+#	Tested on following Evironments:
+#	>Ubuntu 12.04 LTS, 14.04 LTS
+#	>Ubuntu 16.04 LTS
+#
+#	Version 0.2.1 :
+#	>Added function for detection of locked files by samba and samba session killing 
+#	>Added function for detection of local used files and offer to user to kill them
+#	>Added missing dependencies 
+#
+#	Version 0.2.2 :
+#   >1. Small changes in comments and source code 
+#   >2. Added script parameters:
+#   >"mount|mount=*|--mount=*|-m=*" 
+#     -> When added, script will mount image, parameter value includes path to image file. 
+#        In case of missing parameter value, script will ask for path to image file.
+#
+#   >"--no-opt-mount|--no-opt|-n" 
+#     -> When added, script will skip second mounting point to /opt/$USER/works.
+#        Parameter is applied only in case of mounting.
+#
+#   >"--mount-point-id=*|-i=*"
+#       When added, and if /mnt/$USER/vd${MOUNT_POINT_ID_NUMBER} is free then try to mount image to this point.
+#
+#	Version 0.2.3 :
+#   Bug in case of ubuntu 16.04: Unable to detect already mounted /opt/$USER/works.
+#   Minority changes in user prompts.
+#
+#   Version 0.2.4 :
+#   >1)prepare_dirs_in_image():Add support for multiple mounted images in case that current image do not have yocto folders
+#   >2)Added script parameters for docker services and also able to mount for any user as root with help of --user parameter:
+#   >"--user=*" 
+#       ->when added script suppose that interactive user input is disabled, 
+#         therefore all parameters have to be filed as input parameters of script
+#
+#   >"--mount-point-id=*|-i=*"
+#       ->used also in case of unmount 
+#   >3)Speed-up mount process instead of sleep add check loops waitforloopdev(), waitforfile()
+#
+#   Version 0.2.5 :
+#   >1)add support for --check-img-dirs in case of -n option for yocto tools and -n option
+#   >2)add support for --unmount-all
+#   >3)add new operation > settings,
+#                          print only settings and export to env LOOPDEV_START_OFFSET, LOWEST_USER_ID, USER_LOOPDEV_MAX
+#                          usefull for other tools ycimg and yocto
+#   >4)add new operation > info,
+#                          print mounted devices for given user
+#  Version 0.2.6 :
+#  >testing suid ...
+#====================================================================
+#LOOPDEV_START_OFFSET=5
+#LOWEST_USER_ID=1000
+#USER_LOOPDEV_MAX=3
+#IMAGE_DIR="/mnt/nas_raid10"
+#========================================================
+
+#Return array of mount points in unmount order
+# $ get_umounts '/mnt/$USER/vd2/' "umount_arr"
+# $ echo "${umount_arr[@]}"
+#
+#due to docker issue and mounted files after service shutdown
+# $cat /proc/mounts
+#/dev/mapper/loop2p1 /mnt/aljp2100592/vd2/docker/aufs ext4 rw,relatime,data=ordered 0 0
+#none /mnt/$USER/vd2/docker/aufs/mnt/46d55b874a0cac8df0979a9c7706e25a631804cfaa9367c8d2d0a5f449466363 aufs rw,relatime,si=d4e6386a2167a323,dio,dirperm1 0 0
+#shm /mnt/$USER/vd2/docker/containers/11db9183e2a5924a733a5689d12dd946614d052054f9872e1256f00cf7eae21a/shm tmpfs rw,nosuid,nodev,noexec,relatime,size=65536k 0 0
+get_umounts() {
+  local _mntroot="$1"
+  local _ret="$2"
+  declare -a _ret_arr 
+  local _mnts=( $(cat /proc/mounts | awk -v mntroot="${_mntroot}" '{
+   mntdevice=$1;mntpoint=$2;
+   fnd=match(mntpoint,mntroot"*")
+   if(fnd==1){ print mntpoint}
+  }') )
+  #inverse order than mount order ....mount 1 2 3; unmount 3 2 1
+  for (( i="${#_mnts[@]}"-1;i>=1; i-- ));do
+   _ret_arr+=( "${_mnts[$i]}" )
+  done
+  
+  eval "${_ret}"='('${_ret_arr[@]}')'
+  
+  return 0
+  
+}
+
+dependencies_test() {
+  #format: all commands here are in format "CMDNAME SOME_PARAMETERS RETURN_VALUE"
+
+   for cmd in "${DEPENDENCIES_LIST[@]}"; do 
+    #
+    sub_cmd_arr=( ${cmd} )
+    lst="${#sub_cmd_arr[@]}"
+    sub_cmd="${sub_cmd_arr[@]:0:lst-1}"
+    cmd_only=${sub_cmd_arr[0]}
+    exp_retval="${sub_cmd_arr[@]: -1}"
+    #
+    retval=$( ${sub_cmd} &>/dev/null)
+    retval=$?
+    if [ "${retval}" != "${exp_retval}" ] && [ "${retval}" != "0" ]; then
+      echo -e "  Error: Dependencies test fail !"
+      echo -e '         "'$sub_cmd'" command should return 0 or "'$exp_retval'"'"\n         but returned value is "'"'$retval'"!' 
+      return 1
+    fi
+   done
+
+  return 0
+}
+
+waitforloopdev() {
+  local _loopdev_num="$1"
+  local _img_file="$2"
+
+  local _isloaded=""
+  while [ "$_isloaded" == "" ]; do
+    sleep 0.2
+    _isloaded=$(sudo losetup -a | egrep "dev.*loop${_loopdev_num}:.*${_img_file}") 
+  done
+}
+
+waitforfile() {
+  local _file="$1"
+
+  while [ ! -e "$_file" ]; do
+    sleep 0.2
+  done
+}
+
+
+#   @param  :   [input]   :    $1  : path  where we wanna search 
+#   @ret    :                      :if [ $? == 0 ]  -> Nothing is locked
+#                                  :if [ $? == 1 ]  -> Some files are locked
+#                                  :if [ $? > 1000] -> User decide to kill processes
+#                                                      if value > 1000 then some program was not properly terminated
+findof() {
+ local basepath_=$1
+ local pid_
+ declare -a pidsall
+
+ #PID,COMMAND_NAME,FILENAME
+ uof=( $(lsof -l -a -u"${logged_user_id_}" -- "${basepath_}"  2>/dev/null | awk 'FNR>1{print $2","$1","$9}') )
+ if [ -z "${uof}" ]; then
+   return 0;
+ else
+  for of in "${uof[@]}"; do
+    pidsall+=("${of%%,*}")
+  done
+  echo -e "\n Following files are used by you:"
+  echo "   ""PID, COMMAND, FILE"
+  for tmp in "${uof[@]}"; do
+   echo "   ""$tmp"
+  done
+ fi
+
+ echo -e "\n All your programs will be terminated!"
+ echo -e " >Do you really want to terminate !? [y/n]"
+ 
+ if [ "$ally_auto_mode" != "y" ]; then
+   read -p " >" resp
+ else
+   resp="y"
+ fi
+ 
+ if [ "$resp" == "y" ];then
+   retsum=50
+   for pid_ in "${pidsall[@]}"; do
+     sudo kill -s KILL "${pid_}"
+     ret_=$?
+     ((retsum=$retsum + $ret_))
+   done
+   return "${retsum}"
+ fi
+
+}
+
+
+#Find locked files by samba and prompt user in this case and offer termination of related samba daemon :
+#   @param  :   [input]   :    $1  : path to mounted samba 
+#   @ret    :                      :if [ $? == 0 ]  -> Nothing is locked
+#				   :if [ $? == 1 ]  -> Some files are locked
+#                                  :if [ $? > 1000] -> User decide to kill his shares, so
+#						       if value > 1000 then some program was not properly terminated
+find_smb_of() {
+ mntpth_=$1
+ retval=0
+ declare -a spids_
+ declare -a lfiles_
+
+ local is_smbd_running_=$(ps -aux | grep smbd | grep -v grep)
+ if [ -z "${is_smbd_running_}" ]; then
+   return 0;
+ fi
+
+ #user identification wit parameter -u"USER" does not work in this  version we have to filter it manually by grep 
+ local lcks_=( $(sudo smbstatus -n -L | awk -v usr="$logged_user_id_" 'FNR>3{if($2==usr){ print $1","$7"/"$8 }}' | grep "${mntpth_}" | grep -v grep ) )
+
+ for lck in "${lcks_[@]}"; do
+  local spid_="${lck%%,*}"
+  spids_+=("$spid_")
+  local lfile_="${lck:${#spid_}+1}"
+  lfiles_+=("$lfile_")
+  #echo "PID  : ""$spid_"";  File : "'"'$lfile_'"'
+ done
+
+ local ips_=( $(sudo smbstatus -n -b | awk -v usr="$logged_user_id_" -v spid="$spid_" 'FNR>3{if($2==usr && $1==spid){ print $4 }}' | grep -v grep ) )
+
+ if [ ! "${#lfiles_[@]}" -eq 0 ]; then
+  echo -e "\n Following files are locked by you:"
+  echo " ""${lfiles_[@]}"
+  retval=1
+ else 
+  return 0
+ fi
+
+ echo -e "\n All your shares connected to this address( "'"'${ips_[@]}'"'" ) will be terminated!"
+ echo -e " >Do you really want to terminate !? [y/n]"
+ 
+ if [ "$ally_auto_mode" != "y" ]; then
+   read -p " >" resp
+ else
+   resp="y"
+ fi
+
+ if [ "$resp" == "y" ]; then
+   echo " Restarting your shares !"
+   retval=1000
+   for ip in "${ips_[@]}"; do
+     sudo smbcontrol smbd kill-client-ip "$ip"
+     ret_=$?
+     ((retval=$retval + $ret_ ))
+   done
+   return "${retval}"
+ fi
+
+ return "$retval"
+
+}
+
+prepare_dirs() {
+  #Create directories in system [/mnt/$user/vd$n; /opt/$user/works ] and set user rights
+  echo " Changing ACLs for loopdevices  : /dev/loop"
+  echo " -"
+  echo ""
+  sudo chmod 777 /dev/loop*
+  echo ""
+
+  for ((_j=0; _j<"${USER_LOOPDEV_MAX}";_j++ )); do
+    local _tmp="/mnt/""${mnt_}""${_j}"
+    if [ ! -d "${_tmp}" ];then
+      echo " Creating directory  : /mnt/*""${_j}"
+      sudo mkdir -p "${_tmp}"
+      sudo chown -R "${logged_user_name_}":"${logged_user_name_}" "/mnt/${logged_user_name_}"
+      sudo chmod 770 "/mnt/""${logged_user_name_}"
+    fi
+  done
+
+  local _tmp="/opt/""${opt_}"
+  if [ ! -d "${_tmp}" ];then
+    echo " Creating directory: /opt/*"
+    sudo mkdir -p "${_tmp}"
+    #sudo chown -R "${logged_user_name_}":"${logged_user_name_}" "${_tmp}"
+    sudo chown -R "${logged_user_name_}":"${logged_user_name_}" "/opt/""${logged_user_name_}"
+    sudo chmod 770 -R "/opt/""${logged_user_name_}"
+  fi
+
+}
+
+
+#Return first free loopdevice number of given user:
+#   @param  : [output]  :       $1                              loopdev_num_
+#   @ret    :                   if [ $? != 0 ]; then -> error
+get_freeloopdev_num() {
+
+  #/dev/mapper/loop1p1 on /mnt/jiri/vmware1
+  #mount | egrep "dev.*mapper.*loop.*${logged_user_name_}"
+  #test=/dev/mapper/loop1p1
+
+  local _first_loopdev_num=$(( ${LOOPDEV_START_OFFSET} + (${USER_LOOPDEV_MAX} * (${logged_user_id_} - ${LOWEST_USER_ID})) ))
+
+  for ((_j=0; _j<"${USER_LOOPDEV_MAX}";_j++ )); do
+    local _loopdev_num=$((${_first_loopdev_num}+${_j}))
+    local _isusedbysystem=`losetup "/dev/loop${_loopdev_num}" 2>/dev/null`
+    local _isused=`mount | egrep "dev.*mapper.*loop${_loopdev_num}p.*${logged_user_name_}"`
+    if [ -z "${_isusedbysystem}" ] && [ -z "${_isused}" ];then 
+      local _ret=$1;
+      eval $_ret=${_loopdev_num}; 
+      return 0; 
+    fi
+  done
+
+  #Error: any available loop devices for given user
+  local _ret="$1"; eval $_ret=""; return 1;
+}
+
+#Test if given mount-point-id is free and return related loopdev:
+#   @param  : [input]   :       $1=mount-point-id
+#   @param  : [output]  :       $2 returned loop device number
+#   @ret    :                  if [ $? != 0 ]; then -> error -> given mount-point-id is NOT free
+get_loopdevnum() {
+  local _mnt_point_id=$1
+  local _ret=$2
+
+  #/dev/mapper/loop1p1 on /mnt/jiri/vd
+  #mount | egrep "dev.*mapper.*loop.*${logged_user_name_}"
+  #test=/dev/mapper/loop1p1
+
+  #loopdev=$(+( ${USER_LOOPDEV_MAX} * (${logged_user_id_} - ${LOWEST_USER_ID} )))
+  local _loopdev_num=$(( ${_mnt_point_id} + ${LOOPDEV_START_OFFSET} + (${USER_LOOPDEV_MAX} * (${logged_user_id_} - ${LOWEST_USER_ID} ))   ))
+  local _isusedbysystem=`losetup "/dev/loop${_loopdev_num}" 2>/dev/null`
+  local _isused=`mount | egrep "dev.*mapper.*loop${_loopdev_num}p.*${logged_user_name_}"`
+  if [ -z "${_isusedbysystem}" ] && [ -z "${_isused}" ]; then 
+    #local _isused=$(losetup -a 2>/dev/null | awk '{print $1}' | egrep "dev.*loop${_loopdev_num}:")
+    eval $_ret=${_loopdev_num};
+    return 0; 
+  else
+    return 1; 
+  fi
+
+}
+
+
+
+
+
+#Return used loopdevice numbers of given user:
+#   @param  :   [output]   :    $1  :array of used loopdevices  >declare -a used_loopdev
+#   @ret    :                       :if [ $? != 0 ] -> Error
+get_usedloopdev_num() {
+
+  #/dev/mapper/loop1p1 on /mnt/jiri/vmware1
+  #mount | egrep "dev.*mapper.*loop.*${logged_user_name_}"
+  #test=/dev/mapper/loop1p1
+
+  declare -a _tmp_arr
+  local _i=0
+  local _first_loopdev_num=$(( ${LOOPDEV_START_OFFSET} + (${USER_LOOPDEV_MAX} * (${logged_user_id_} - ${LOWEST_USER_ID} ))    ))
+  local _last_loopdev_num=$(( ${_first_loopdev_num} + ${USER_LOOPDEV_MAX} ))
+
+  for ((_j=0; _j<"${USER_LOOPDEV_MAX}";_j++ ));do
+    local _loopdev_num=$((${_first_loopdev_num}+${_j}))
+    #local _isused=`losetup -a | egrep "dev.*loop${_loopdev_num}.*${logged_user_name_}"`
+    local _isused_num=`losetup -a 2>/dev/null | egrep "dev.*loop${_loopdev_num}:.*qemurawimg" | awk '{ str_len=length($1); num=substr($1,10,str_len-10); print num }'`
+    if [ ! -z "${_isused_num}" ]; then
+      ##(loop_num <= max) && (loop_num >= min)
+      if [ "${_isused_num}" -le "${_last_loopdev_num}" ] && [ "${_isused_num}" -ge "${_first_loopdev_num}" ]; then 
+        _tmp_arr[${_i}]=${_loopdev_num}; _i=$(( $_i + 1 ));
+      fi
+    fi
+  done
+
+  echo 
+  local _ret="$1";
+  eval $_ret='('${_tmp_arr[@]}')';
+  
+  return 0;
+}
+
+#Check if we have got our image
+# The image have to have following  path: /opt/$user/works if not stop mounting !
+#   @param  :       $1		:	path to img "/mnt/""${mnt_}""${_vd_num}""/opt/""${opt_}"
+#   @ret    :       0|1		:	img ok ?	:	if [ $? != 0 ]; then -> error
+check_imgowner() {
+  local _tmp="$1"
+  if [ -d "${_tmp}" ]; then
+	#directory exist > Ok
+	return 0;
+  else	
+	#directory not exist >NG > error
+	return 1;
+  fi
+}
+
+
+#Mount raw image:
+#   @param  :           $1                              loopdev_num_
+#   @param  :           $2                              skip_opt_mount
+#   @param  :           $3                              check_img_dirs(check if /opt/USER/works exist )
+#   @param  : (output)  $4                              cur_mounted
+#   @ret    :       if [ $? != 0 ]; then -> error
+mount_rawimg() {
+  local _loopdev_num=$1
+  local _skip_opt_mount=$2
+  local _check_img_dirs=$3
+  local _ret=$4
+  declare -a tmp
+
+  local _first_loopdev_num=$(( ${LOOPDEV_START_OFFSET} + (${USER_LOOPDEV_MAX} * (${logged_user_id_} - ${LOWEST_USER_ID}))   ))
+
+  #012, 345,uid=1001,devnum=4;vd=1;
+  #vd_num=_loopdev_num-_first_dev_num
+  local _vd_num=$(( ${_loopdev_num} - ${_first_loopdev_num}  ))
+
+  #echo  "losetup: ""$path_to_img_file"
+  sudo losetup "/dev/loop${_loopdev_num}"  "$path_to_img_file"
+  ret=$?; if [ ! "${ret}" == 0 ];then { return 1; }; fi
+  
+  waitforloopdev "${_loopdev_num}" "${path_to_img_file}"
+  #echo "kpartx: ""/dev/loop${_loopdev_num}"
+  sudo kpartx -a "/dev/loop${_loopdev_num}"
+  ret=$?; if [ ! "${ret}" == 0 ];then { return 1; }; fi
+
+  waitforfile "/dev/mapper/loop${_loopdev_num}p1"
+  #echo "mount0: ""/dev/mapper/loop""${_loopdev_num}""p1" "/mnt/""${mnt_}""${_vd_num}"
+  sudo mount "/dev/mapper/loop""${_loopdev_num}""p1" "/mnt/""${mnt_}""${_vd_num}"
+  ret=$?; if [ ! "${ret}" == 0 ];then { return 1; }; fi
+
+  tmp="  /mnt/""${mnt_}""${_vd_num}"
+  eval $_ret='('"${tmp[@]}"')'
+
+  if [ "${_skip_opt_mount}" == "y" ]; then
+    if [ "${_check_img_dirs}" == "y" ]; then
+      local _path2check="/mnt/""${mnt_}""${_vd_num}""/opt/""${opt_}"
+      check_imgowner "${_path2check}"
+      ret=$?
+      if [ ! "${ret}" -eq 0 ]; then
+        return  3;
+      fi
+    fi
+    return 0;
+  else
+    local _path2check="/mnt/""${mnt_}""${_vd_num}""/opt/""${opt_}"
+    check_imgowner "${_path2check}"
+    ret=$?
+    if [ ! "${ret}" -eq 0 ]; then
+      return  3;
+    fi
+  fi
+    #mount
+    #/dev/mapper/loop0p1 on /mnt/$USER/vd0 type ext4 (rw)
+    #in case of ubuntu 12.04 or 14.04
+      #/mnt/$USER/vd0/opt/$USER/works on /opt/$USER/works type none (rw,bind)
+    #in case of ubuntu 16.04
+      #/dev/mapper/loop0p1 on /opt/$USER/works type ext4 (rw,relatime,data=ordered)
+    opt_is_used_1204=`mount | egrep -iv grep | egrep "mnt.*${logged_user_name_}.*vd.*opt.*${logged_user_name_}.*works.*on.*opt.*${logged_user_name_}.*works"`
+    opt_is_used_1604=`mount | egrep -iv grep | egrep "dev.*mapper.*loop.*p.*on.*opt.*${logged_user_name_}.*works.*type"`
+    #echo "opt_is_used: ""$opt_is_used"
+    if [ ! -z "${opt_is_used_1204}" ]; then
+      return 2;
+    elif [ ! -z "${opt_is_used_1604}" ]; then
+      return 2;
+    else
+
+      sudo mount -o bind "/mnt/""${mnt_}""${_vd_num}""/opt/""${opt_}"  "/opt/""${opt_}"
+      ret=$?; if [  "${ret}" != 0 ];then { return 1; }; fi
+    fi
+
+  tmp="  /mnt/${mnt_}${_vd_num}"
+  tmp+=("  /opt/${opt_}")
+  eval $_ret='('"${tmp[@]}"')'
+
+  return 0
+}
+
+#Un-Mount raw image:
+#   @param  :       $1                              loopdev_num_
+#   @ret    :       if [ $? != 0 ]; then -> error
+umount_rawimg() {
+  local _loopdev_num=$1 
+
+  local _first_loopdev_num=$(( ${LOOPDEV_START_OFFSET} + (${USER_LOOPDEV_MAX} * (${logged_user_id_} - ${LOWEST_USER_ID}))   ))
+
+  #012, 345,uid=1001,devnum=4;vd=1;
+  #vd_num=_loopdev_num-_first_dev_num
+  local _vd_num=$(( ${_loopdev_num} - ${_first_loopdev_num}  ))
+
+  
+  #mount
+  #check if given number of loop is connected with opt user works
+  #/dev/mapper/loop15p1 on /mnt/$USER/vd0 type ext4 (rw)
+  #in case of ubuntu 12.04 or 14.04
+    #/mnt/$USER/vd0/opt/$USER/works on /opt/$USER/works type none (rw,bind)
+  local _ismounted2optuserworks_1204=`mount | egrep -iv grep | grep "mnt.*${logged_user_name_}.*vd${_vd_num}.*opt.*${logged_user_name_}.*works.*opt.*${logged_user_name_}.*works"`
+
+  #in case of ubuntu 16.04
+    #/dev/mapper/loop0p1 on /opt/$USER/works type ext4 (rw,relatime,data=ordered)
+  local _ismounted2optuserworks_1604=`mount | egrep -iv grep | grep "dev.*mapper.*loop${_loopdev_num}p1.*on.*opt.*${logged_user_name_}.*works"`
+
+  findof "/mnt/""${mnt_}""${_vd_num}" 
+
+  find_smb_of "/opt/""${opt_}"
+  
+  #Added due to docker and remaining mount points in 
+  #get_umounts '/mnt/$USER/vd2/' "umount_arr"
+  get_umounts "/mnt/${mnt_}${_vd_num}/" "umount_arr"
+  local _mntpoint
+  for _mntpoint in "${umount_arr[@]}"; do 
+    sudo umount "${_mntpoint}"
+    ret="$?"; 
+    [ "${ret}" != 0 ] && return 111
+  done
+  
+
+  #echo "_ismounted2optusernetworks_1604: ""$_ismounted2optuserworks_1604"
+  local _rtmp=0
+  if [ ! -z "${_ismounted2optuserworks_1204}" ]; then
+	  sudo umount "/opt/""${opt_}"
+	  ret="$?"; if [ "${ret}" != 0 ];then { _rtmp=$(( $_rtmp + 1 )); }; fi
+  fi
+
+  if [ ! -z "${_ismounted2optuserworks_1604}" ]; then
+	  sudo umount "/opt/""${opt_}"
+	  ret="$?"; if [ "${ret}" != 0 ];then { _rtmp=$(( $_rtmp + 2 )); }; fi
+  fi
+
+  find_smb_of "/mnt/""${mnt_}""${_vd_num}" 
+
+  sudo umount "/mnt/""${mnt_}""${_vd_num}"
+  ret="$?"; if [ "${ret}" != 0 ];then { _rtmp=$(( $_rtmp + 4 )); }; fi
+
+  sudo kpartx -d  "/dev/loop${_loopdev_num}"
+  ret="$?"; if [ "${ret}" != 0 ];then { _rtmp=$(( $_rtmp + 8 )); }; fi
+
+  sudo losetup -d  "/dev/loop${_loopdev_num}"
+  sleep 0.5
+  #losetup function return 0 even if device was not un-mounted
+  local _isused=`losetup -a | egrep "dev.*loop${_loopdev_num}:"`
+  sleep 1; if [ ! -z "${_isused}" ];then { _rtmp=$(( $_rtmp + 16 )); }; fi
+
+  return "${_rtmp}"
+
+}
+
+
+#Mount qcow2 image:
+#   @param  :    $1   loopdev_num_
+#   @ret    :       if [ $? != 0 ]; then -> error
+#Should not be used... due to nbd device number 
+mount_qcow2img() {
+  local _dev_num=$1
+  #local _ret=$2
+  
+  sudo modprobe nbd
+  ret=$?; if [ ! ${ret} == 0 ];then { return 1; }; fi
+  
+  sudo qemu-nbd -c "/dev/nbd${_dev_num}" "$path_to_img_file"
+  ret=$?; if [ ! ${ret} == 0 ];then { return 1; }; fi
+  
+  sudo mount "/dev/nbd${_dev_num}p1" "/mnt/""${mnt_}"
+  ret=$?; if [ ! ${ret} == 0 ];then { return 1; }; fi
+  
+  sudo mount -o bind "/mnt/""${mnt_}""/opt/""${opt_}"  "/opt/""${opt_}"
+  ret=$?; if [ ! ${ret} == 0 ];then { return 1; }; fi
+  
+  return 0
+}
+
+#Un-Mount qcow2 image:
+#   @param  :    $1   loopdev_num_
+#   @ret    :       if [ $? != 0 ]; then -> error
+#Should not be used... due to nbd device number 
+umount_qcow2img() {
+  local _dev_num=$1
+  
+  sudo umount "/opt/""${opt_}"
+  ret=$?; if [ ! ${ret} == 0 ];then { return 1; }; fi
+  
+  sudo umount "/mnt/""${mnt_}"
+  ret=$?; if [ ! ${ret} == 0 ];then { return 1; }; fi
+  
+  sudo qemu-nbd -d "/dev/nbd${_dev_num}"
+  ret=$?; if [ ! ${ret} == 0 ];then { return 1; }; fi
+  
+  #print0=`ps -aux | grep -E "qemu-nbd.*dev" | grep -v grep`
+
+  return 0
+}
+
+
+#Return used loopdevice numbers of given user:
+#   @param  :   [output]   :    $1  : declare -a vd_num
+#   @param  :   [input]    :    $2  : loopdevice number which was currently mounted
+#   @ret    :              :    if [ $? -eq 1 ] -> Created directories >ok > next mount
+#                          :    if [ $? -eq 2 ] -> Directories werent created > error > exit 
+yocto_env_prepare_dirs_in_image () {
+  echo ""
+  local _loopdev_num="$2"
+  local _cnt=`mount 2>/dev/null | egrep "dev.*mapper.*loop${_loopdev_num}p1.*mnt.*${logged_user_name_}.*vd" | awk '{i+=1}END{print i}'`
+  if [ ! "$_cnt" -eq 1 ]; then
+    return 2
+  fi
+
+    #_mnt_point => /mnt/$USER/vd0
+    local _mnt_point=`mount 2>/dev/null | egrep "dev.*mapper.*loop${_loopdev_num}p1.*mnt.*${logged_user_name_}.*vd" | awk '{ print $3 }'`
+    local _used_space=`df -h 2>/dev/null "$_mnt_point"  | grep "${logged_user_name_}" | awk '{ print $5 }'`
+    local _used_space="${_used_space::-1}"
+
+    if [ "$_used_space" -lt 3 ]; then 
+
+      echo " The image is most pobably blank (used space <3%) and partialy prepaired for given user."
+      echo ""
+      echo " Do you wanna create folders in image in order to mount image properly for current user ? y/n"
+      
+      if [ "$ally_auto_mode" != "y" ]; then
+        read -p " >" yn
+      else
+        yn="y"
+      fi
+      
+      if [ "$yn" == "y" ]; then 
+
+        #Create folders in image 
+        sudo mkdir -p "${_mnt_point}""/opt/""$opt_"
+        sudo chown -R "${logged_user_name_}":"${logged_user_name_}"  "${_mnt_point}""/opt/""${logged_user_name_}"
+        sudo chmod 770 -R "${_mnt_point}""/opt/""${logged_user_name_}"
+
+        sudo chown "${logged_user_name_}":"${logged_user_name_}"  "${_mnt_point}""/opt/"
+        sudo chmod 770 "${_mnt_point}""/opt/"
+
+        sleep 1
+
+        local _ret="$1";
+
+        #return vd X number > mount point id
+        eval "$_ret"="${_mnt_point##*vd}";
+
+        return 1
+
+      fi
+
+      return 2
+
+    fi
+
+}
+
+# @param $1 	-empty parameter	: try to mount 
+#		        -some string		: try to unmount
+# 
+mainbash () {
+
+  echo ""
+
+  echo -e "Input Parameters: \n"
+  echo -e "  Operation                       : ""$operation"
+  echo -e "  Path to image file              : ""$path_to_img_file"
+  echo -e "  Skip opt mount                  : ""$skip_opt_mount"
+  echo -e "  Mount point id                  : ""$mount_point_id"
+  echo -e "  Run as user                     : ""$runasuser"
+  echo -e "  Check img dir(/opt/USER/works)  : ""$check_img_dirs"
+  echo ""
+  
+  #=GLOBAL_VARIABLES==========================================
+  mnt_="${logged_user_name_}/vd"
+  opt_="${logged_user_name_}/works/"
+  #=GLOBAL_VARIABLES==========================================
+
+  if [ "$operation" = "info" ]; then
+    echo -e "Used Loop Devices:"
+
+    get_usedloopdev_num "_usdloopdevs"
+    for _uldevn in "${_usdloopdevs[@]}"; do
+      bla=$(sudo losetup -a | egrep "dev.*loop${_uldevn}:.*qemurawimg")
+      echo "  ${bla}"
+    done
+    echo
+    return 0;
+  elif [ "$operation" = "mount" ]; then
+    MNT_STRING="|=MOUNT==============================="
+    echo ${MNT_STRING}; echo ""
+    
+    prepare_dirs
+
+    if [ -z "$path_to_img_file"  ] || [ "$path_to_img_file" == ""  ]; then
+    
+      if [ -d "${IMAGE_DIR}/${logged_user_name_}" ]; then
+        echo  "Current folder is "'"'"${IMAGE_DIR}/${logged_user_name_}"'"'
+        echo ""
+        cd "${IMAGE_DIR}/${logged_user_name_}"
+      else
+        if [ -d "${IMAGE_DIR}" ]; then
+          echo ' User`s folder does not exist, current folder is '"${IMAGE_DIR}!"  
+          echo ""
+          cd "${IMAGE_DIR}"
+        fi
+      fi
+      echo " Please enter the path to the image file:"
+      read -p " >"  -e  path_to_img_file
+    fi
+
+    if [ ! -f "$path_to_img_file" ] || [ -z "$path_to_img_file" ]; then
+      echo " Error: Image file not found ! Exiting"; echo ${MNT_STRING}
+      return 1
+    fi
+
+    israwimg=`echo "$path_to_img_file" | grep -E "\..*raw"`
+    #isqcow2img=`echo "$path_to_img_file" | grep -E "\..*qcow2"`
+
+    if [ ! -z "$israwimg" ]; then
+      #echo " MOUNTING RAW IMAGE:"
+
+      get_freeloopdev_num "_freeloopdev_num_"
+      ret_="$?";
+      if [ ${ret_} != 0 ]; then
+         echo -e "\n Error: Any free loop devices ! Exiting"; 
+         mnt_stat_=${ret_}
+      else
+     
+        if [ "${mount_point_id}" == "" ]; then
+          #mount point id is not defined -> auto mode
+          mount_rawimg "${_freeloopdev_num_}" "${skip_opt_mount}" "${check_img_dirs}" "cur_mnt_points"
+          mnt_stat_="$?"
+        else 
+          #mount point id is defined -> check if related loopdevnum is available 
+            get_loopdevnum "${mount_point_id}" "_freeloopdev_num_"
+            ret=$?
+            if [ ! "$ret" -eq 0 ]; then 
+              echo -e "\n Error: Given mount-point-id is occupied, no free loop devices ! Exiting"; 
+              mnt_stat_=${ret}
+            else
+              mount_rawimg "${_freeloopdev_num_}" "${skip_opt_mount}" "${check_img_dirs}" "cur_mnt_points"
+              mnt_stat_="$?"                
+            fi
+        fi
+        
+        if [ "${mnt_stat_}" -eq 2 ]; then
+
+         echo ""
+         echo " Error/Warning: The mount destination" '"/opt/'${logged_user_name_}'/works"'' is already in use'
+         echo " The rest of mount steps ware successfully finished"
+
+        fi
+
+        if [ "${mnt_stat_}" -eq 3 ]; then
+
+          echo ""
+          echo " Error:　The current user differs from image user.  "
+          echo "       　Please check if you have following path on image: /mnt/USERNAME/vdX/opt/USERNAME/works/"
+          echo "         " 
+
+          yocto_env_prepare_dirs_in_image "vd_num_fixed" "${_freeloopdev_num_}"
+          ret="$?"
+          if [ "${skip_opt_mount}" == "y" ]; then
+            mnt_stat_="0"
+          else
+            if [ "${ret}" -eq 1 ]; then
+              sudo mount -o bind "/mnt/""${mnt_}""${vd_num_fixed}""/opt/""${opt_}"  "/opt/""${opt_}"
+              cur_mnt_points+=("/opt/${opt_}\n")
+              mnt_stat_="0"
+            fi
+          fi
+
+        fi
+
+      fi
+
+    fi
+
+
+    #if [ ! -z "$isqcow2img" ]; then
+    #    echo " MOUNTING QCOW2 IMAGE:"
+    #    echo " Error: Not supported, if u need it u can do it "
+    #    exit 0
+    #fi
+
+    echo ""
+    echo " Added mount points:"
+    for mp in "${cur_mnt_points[@]}"; do
+      echo -e "  ""$mp"
+    done
+    
+
+    echo  ""
+    if [ "${mnt_stat_}" != 0 ]; then
+      echo " MOUNT>ERROR[${mnt_stat_}]"
+    else
+      echo " MOUNT>OK[${mnt_stat_}]"
+    fi
+    echo ""
+
+  elif [ "$operation" = "umount" ]; then
+    MNT_STRING="|=UN-MOUNT==============================="
+
+    echo ${MNT_STRING}; echo ""
+
+    #/dev/loop1: [0023]:2304264196 (/mnt/nas_raid10/share/tmp/20141002_clean_fsl_bsp_sabreauto/_brd20141114_fsl_bsp_sabreauto_kernel31017_40GB_ext4.qemurawimg)
+    #israwimg=`sudo losetup -a 2>/dev/null | grep -E "dev.*loop" | grep -E "\..*raw"`
+    #isqcow2img=`ps -aux | grep -v grep | grep "qemu-nbd" | grep -E "dev.*nbd" | grep -E "\..*qcow2"`
+
+    get_usedloopdev_num "_usedloopdev_num_"
+
+    if [ "${#_usedloopdev_num_[@]}" != 0 ]; then
+
+      if [ "${ally_auto_mode}" == "y" ]; then
+          mnt_stat_="0"
+          for used_loopdev_num in "${_usedloopdev_num_[@]}"; do
+            local _rem_loopdev_num=$(( ${mount_point_id} + ${LOOPDEV_START_OFFSET} + (${USER_LOOPDEV_MAX} * (${logged_user_id_} - ${LOWEST_USER_ID} ))   ))
+
+            if [ "${used_loopdev_num}" -eq "${_rem_loopdev_num}" ]; then
+              umount_rawimg "${_rem_loopdev_num}"
+              mnt_stat_="$?"
+              break
+            fi
+          done
+
+      else
+        if [ "${#_usedloopdev_num_[@]}" == 1 ]; then
+          umount_rawimg "${_usedloopdev_num_[0]}"
+          mnt_stat_="$?"
+        else
+          echo ""
+          echo ' You are using more than one loop device, what do you want to un-mount?'
+            for loopdev_num in "${_usedloopdev_num_[@]}"; do
+              #/dev/loop1: [0023]:2304264196 (/mnt/nas_raid10/share/tmp/20141002_clean_fsl_bsp_sabreauto/_brd20141114_fsl
+               _tmp=`losetup -a 2>/dev/null | awk '{print $1 $3}' | egrep "dev.*loop${loopdev_num}:"`
+               echo "  ${_tmp}"
+            done
+            echo ""
+            echo ' Enter the number of loop device:'
+            read _choosed_loopdev_num
+            umount_rawimg "${_choosed_loopdev_num}"
+            mnt_stat_="$?"
+        fi
+      fi
+      
+    else
+      echo " Error: Nothing to un-mount! ";echo ""
+      echo ${MNT_STRING};echo ""
+      return 0
+    fi
+    
+    if [ "${mnt_stat_}" -gt 3 ]; then
+     echo " UN-MOUNT>ERROR[${mnt_stat_}]"
+    else
+     echo " UN-MOUNT>OK[${mnt_stat_}]"
+    fi
+
+    _tmp=( `sudo losetup -a | awk '{print $1 $3}' | egrep "dev.*loop"` )
+    echo ""
+    echo "  Used all loop devices :"
+    for line in "${_tmp[@]}"; do
+    	echo "   ${line}"
+    done
+    echo ""
+
+    #if [ ! -z "$israwimg" ]; then
+    #  echo "UN-MOUNTING RAW IMAGE:"
+    #  umount_rawimg
+    #fi
+
+    #if [ ! -z "$isqcow2img" ]; then
+    #  echo "UN-MOUNTING QCOW2 IMAGE:"
+    #  echo " Error: Not supported, if u need it u can do it "
+    #  exit 0
+    #fi
+
+  fi
+  
+  echo ${MNT_STRING};echo ""
+  return ${mnt_stat_}
+
+}
+
+
+LOOPDEV_START_OFFSET="${1}"
+LOWEST_USER_ID="${2}"
+USER_LOOPDEV_MAX="${3}"
+IMAGE_DIR="${4}"
+operation="${5}"
+path_to_img_file="${6}"
+skip_opt_mount="${7}"
+check_img_dirs="${8}"
+mount_point_id="${9}"
+runasuser="${10}"
+ally_auto_mode="${11}"
+logged_user_id_="${12}"
+logged_user_name_="${13}"
+
+#echo LOOPDEV_START_OFFSET=$LOOPDEV_START_OFFSET
+#echo LOWEST_USER_ID=$LOWEST_USER_ID
+#echo USER_LOOPDEV_MAX=$USER_LOOPDEV_MAX
+#echo IMAGE_DIR=$IMAGE_DIR
+#echo operation=$operation
+#echo path_to_img_file=$path_to_img_file
+#echo skip_opt_mount=$skip_opt_mount
+#echo check_img_dirs=$check_img_dirs
+#echo mount_point_id=$mount_point_id
+#echo runasuser=$runasuser
+#echo ally_auto_mode=$ally_auto_mode
+#echo logged_user_id_=$logged_user_id_
+#echo logged_user_name_=$logged_user_name_
+
+
+DEPENDENCIES_LIST=( "grep --help 0" "egrep --help 0" "awk --help 0" "mkdir --help 0" "chmod --help 0" \
+                    "chown --help 0" "losetup --help 0" "kpartx --help 1" "mount --help 0" "id --help 0" \
+                    "smbstatus --help 1" "smbcontrol --help 1" "lsof -h 0" )
+dependencies_test
+ret=$?
+[ "${ret}" != "0" ] && exit 1
+
+
+mainbash

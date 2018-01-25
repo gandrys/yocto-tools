@@ -1,0 +1,101 @@
+#!/bin/bash
+#====================================================================
+# NAME          :       ycimg
+# AUTHOR        :       Andrys Jiri
+# DATE          :       2017.10.31
+# VERSION       :       1.41
+# DEPENDENCIES:
+#               1)binaries: qemu-img, bash, egrep, mkdir, chmod, chown, id, grep, df
+#
+# DESCRIPTION   :
+#           Create raw image in order to use it as container for yocto environment
+#
+#  Version 1.4 :
+#   >New input parameters for bash mode 
+#    "--user="USERNAME"
+#    "--img-size-gb="IMAGE_SIZE_IN_GIGA_BYTES"
+#    "--img-path="IMAGE_PATH_AND_IMG_NAME_WITHOUT_EXTENSION"
+#====================================================================
+
+
+help_desc () {
+echo -e "\
+
+Create Raw Image:
+
+  Usage:  ycimg OPTIONS
+
+          Two modes are available: 
+            1)All input options have to be filled
+            2)No options have to be filled
+            
+          where OPTIONS are  = {--user="USERNAME" }
+          
+          where OPTIONS are  = {--img-size-gb="IMAGE_SIZE_IN_GIGA_BYTES" }
+          
+          where OPTIONS are  = {--img-path="IMAGE_PATH_AND_IMG_NAME_WITHOUT_EXTENSION" }
+"
+}
+
+
+runasuser=""
+image_size_gb=""
+img_pth=""
+img_name=""
+img_dir=""
+interactive_mode=""
+
+for arg in "$@"; do
+  case "$arg" in 
+    --help|-h|help|\?)
+      help_desc
+      exit 0;
+    ;;
+    
+    --user=*)
+      runasuser="${arg#*=}"
+    ;;
+    
+    --img-size-gb=*)
+      image_size_gb="${arg#*=}"
+    ;;
+
+    --img-path=*)
+      img_pth="${arg#*=}"
+      img_name="${img_pth##*/}"
+      img_dir="${img_pth%/*}"
+    ;;
+  esac
+done
+
+#We can not allow normal user(uid!=0) run as different user ..
+#
+if [ "${runasuser}" != "" ]; then
+  #TODO:If we do not have this we allow any user run symount as root>wrong, we have to kick out user from here
+  if [ $(id -u) != 0 ]; then
+    echo " Error: Please run this command as root"
+    echo ""
+    exit 1
+  fi
+  logged_user_id_=$(id -u "${runasuser}")
+  logged_user_name_=$(id -un "${runasuser}")
+else
+  logged_user_id_=$(id -u)
+  logged_user_name_=$(id -un)
+fi
+
+
+if [ "${image_size_gb}" == "" ] && [ "${img_pth}" == "" ]; then
+  interactive_mode="y"
+
+elif [ "${image_size_gb}" != "" ] && [ "${img_pth}" != "" ]; then
+  interactive_mode=""
+
+else
+  echo "Error: All parameters on any parameters have to be set"
+  exit 1
+fi
+# INPUT PARAMETERS ==================================================================
+
+#id -un
+sudo /usr/local/bin/sycimg "${logged_user_id_}" "${logged_user_name_}" "${image_size_gb}" "${img_name}" "${img_dir}" "${interactive_mode}"

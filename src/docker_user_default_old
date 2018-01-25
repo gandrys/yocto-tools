@@ -1,0 +1,5 @@
+#Template file for docker_user settings. 
+#This file will be used only once per first start of docker_user service
+#and set path to storage in user related settings.
+EXT_MOUNT_DOCKER_STORAGE="/mnt/nas_raid10/$_USER/images/docker/docker_imgs_storage.qemurawimg"; 
+DOCKER_OPTS="--dns 8.8.8.8 --dns 8.8.4.4 -g ${RUNTIME_FOLDER_IMAGES} ${COM_SOCKET} -p ${OPT_FOLDER}/docker.pid --exec-root=${OPT_FOLDER}/execroot "

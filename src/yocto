@@ -1,0 +1,2239 @@
+#!/bin/bash
+#====================================================================
+# NAME      :   yocto
+# AUTHOR    :   Andrys Jiri
+# DATE      :   2018.01.08
+# VERSION   :   0.66
+#
+# DEPENDENCIES :
+#               Binaries: bash, grep, egrep, awk, mkdir, chmod, chown, 
+#                         losetup, kpartx, mount, id, smbstatus, 
+#                         smbcontrol, docker, base64 
+#
+#
+# DESCRIPTION :
+#               Prepare environment for yocto and allows 
+#               to build with yocto in any environment.
+#
+#               It also allows separation of yocto evironments for different BSPs.
+#               Includes/install multi-user helper scripts:
+#                   /usr/local/bin/ycimg
+#                   /usr/local/bin/ymount
+#                   /usr/local/bin/umess.sh
+#
+#               Includes multi-user-docker_user* services/environment
+#               for systemd supported OS.
+#
+# TESTED ENV  :
+#               Windows 7 Professional"   32/64bit
+#               Ubuntu1604:               "builmachine mode(multi-user) mode", "single-user mode"
+#               Ubuntu1404:               "single-user mode"
+#               Fedora23:                 "single-user mode"
+#               Fedora24:                 "single-user mode"
+#
+#
+#
+#====================================================================
+
+tool_getver() {
+  local _ret=$1
+  local _LINK_TO_VERSION='https://raw.github.com/gandrys/yocto-tools/master/sources/version'
+
+  #local _LINK_TO_VERSION='https://raw.github.com/gandrys/trabla/master/src/bobek.b'
+  #wget in case of no error return 0,
+  #we have not to have local modificator in this case because retval value is gonna dissapear
+
+  _new_ver=$( wget -qO - "${_LINK_TO_VERSION}" )
+  errlev=$?;
+
+  #echo $errlev
+  #echo $_new_ver
+ 
+  eval ${_ret}="${_new_ver}"
+  return "${errlev}"
+ 
+}
+
+#return 1 if web_ver>loc_ver ===> update
+cmpver() {
+  local _loc=$1
+  local _web=$2
+  #version have only this format and have to have X.X only
+  #3.3212312312312<4.2
+  
+  local _loc_min="${_loc##*.}"
+  local _loc_maj="${_loc%%.*}"
+
+  local _web_min="${_web##*.}"
+  local _web_maj="${_web%%.*}"
+  
+  if [ "${_web_maj}" -gt "${_loc_maj}" ]; then
+    #update "${_web_maj}" > "${_loc_maj}"
+    return 1
+  else
+    #update "${_web_maj}" =< "${_loc_maj}"
+    if [ "${_web_maj}" -eq "${_loc_maj}" ]; then
+      # "${_web_maj}" == "${_loc_maj}"
+      #check minor
+      if [ "${_web_min}" -gt "${_loc_min}" ]; then
+        #update "${_web_min}" > "${_loc_min}"
+        return 1
+      else
+        return 0
+      fi
+      
+    else
+      #         2.343434    <   3.2
+      #update "${_web_maj}" < "${_loc_maj}"
+      #do nothing> working on new local ver
+      return 0
+    fi
+    
+  fi
+  
+}
+
+
+yocto_tools_update() {
+  local _update_dir=$1
+  local _LINK_TO_UPDATE="https://github.com/gandrys/yocto-tools.git"
+  echo -e "\n  Updating: \n"
+  
+  mkdir -p "${_update_dir}"
+  
+  local _bla=$(git clone "${_LINK_TO_UPDATE}" -C "${_update_dir}" )
+  local _ret=$?
+  if [ "${_ret}" != "0" ]; then 
+    echo -e "  Error: git clone ${_LINK_TO_UPDATE} -C ${_update_dir} "
+    exit 1 
+  fi
+  
+  yn="n"
+  echo -e "  \nInfo: Do you want to install docker services to support multi-user environment ? [y/n]"
+  read -p "        >" yn
+  if [ "$yn" == "y" ]; then 
+    "${_update_dir}/yocto" install --install-subsystem-files --install-services
+  else
+    "${_update_dir}/yocto" install --install-subsystem-files
+  fi
+
+}
+
+
+try2update() {
+
+
+  if [ "$(date +%u)" != "3" ]; then 
+    return 1
+  fi
+  
+  echo -e "\nChecking latest version:"
+  
+  tool_getver web_version
+  ret=$?
+  yn="n"
+  if [ "${ret}" != "0" ]; then  
+    echo -e "  Warning: Unable to check on-line version.\n"
+    return 1
+  fi
+  
+  cmpver "${VERSION}" "${web_version}"
+  ret=$?
+  if [ "${ret}" -eq "1" ]; then 
+     echo -e "\nWarning: New version of yocto-tools is available."
+     echo -e "         Do you want to install new yocto-tools, version ${new_version} [y/n]"
+     read -p "         >" yn
+  fi
+  
+  if [ "${yn}" == "y" ]; then  
+    UPDATE_DIRECTORY="${YOCTO_DOCKER_CONFIG_DIR}/update_${new_version}" ]
+    
+    yocto_tools_update "${UPDATE_DIRECTORY}"
+    
+    for up_dir in "${YOCTO_DOCKER_CONFIG_DIR}/update_"*; do
+     [ "${up_dir##*_}" == "${new_version}"* ] && continue
+     
+     #no one wanna delete whole drive .... 
+     if [[ "${up_dir}" == *"yocto_docker"* ]]; then
+      rm -rf "${up_dir}"
+     fi
+    done
+    
+    exit 0
+  fi
+
+}
+
+
+
+
+
+#In case of Fedora and enabled SeLinux we are not able to mount image to docker 
+selinux_mnt_enable(){
+
+  local _rettxt
+  local _ret
+  _rettxt=$(sestatus 2>/dev/null)
+  _ret=$?
+  local _iscontext=$(ls -dZ /mnt/${USER_NAME_HOST}/vd0/opt | grep "svirt_sandbox_file_t" )
+  
+  if [ "${_ret}" == "0" ] && [ -z "${_iscontext}" ]; then
+    echo -e "\n  SElinux: Changing Context\n"
+    ${sudo} chcon -Rt svirt_sandbox_file_t /mnt/${USER_NAME_HOST}/vd0/opt
+  fi
+}
+
+dependencies_test() {
+  #format: all commands here are in format "CMDNAME SOME_PARAMETERS RETURN_VALUE"
+
+   for cmd in "${DEPENDENCIES_LIST[@]}"; do 
+    #
+    sub_cmd_arr=( ${cmd} )
+    lst="${#sub_cmd_arr[@]}"
+    sub_cmd="${sub_cmd_arr[@]:0:lst-1}"
+    cmd_only=${sub_cmd_arr[0]}
+    exp_retval="${sub_cmd_arr[@]: -1}"
+    #
+    
+    if [ "${OS_STRING}" != "NATIVE_LINUX" ]; then
+      isnativekrncmd=$(echo "${cmd_only}" | egrep "(docker|losetup|kpartx|mount|smbstatus|smbcontrol|qemu-img|mkfs.ext4|fdisk)" )
+      [ ! -z "${isnativekrncmd}" ] && continue
+    fi
+    
+    retval=$( ${sub_cmd} &>/dev/null)
+    retval=$?
+    if [ "${retval}" != "${exp_retval}" ] && [ "${retval}" != "0" ]; then
+      echo -e "  Error: Dependencies test fail !"
+      echo -e '         "'$sub_cmd'" command should return 0 or "'$exp_retval'"'"\n         but returned value is "'"'$retval'"!' 
+      return 1
+    fi
+   done
+
+  return 0
+}
+
+
+get_base_image_archive(){
+  local _yocto_base_docker_file=$1
+  #/bla/bla/ubuntu1404_yocto_base_dependencies.v2.docker"
+  #dir=/new_dir
+  #ret=/new_dir/ubuntu1404_yocto_base_dependencies.v2.docker.tar.bz2
+  local _ret=$2
+
+  local _bla="${_yocto_base_docker_file##*/}"
+  _arch="${_bla}.tar.bz2"
+
+  eval "${_ret}"="${_arch}"
+}
+
+get_base_image_archive_path(){
+  local _temp_inst_dir=$1
+  local _yocto_base_docker_file=$2
+  #/bla/bla/ubuntu1404_yocto_base_dependencies.v2.docker"
+  #dir=/new_dir
+  #ret=/new_dir/ubuntu1404_yocto_base_dependencies.v2.docker.tar.bz2
+  local _ret=$3
+
+  get_base_image_archive "${_yocto_base_docker_file}" _blabla
+
+  _arch="${_temp_inst_dir}/${_blabla}"
+
+  eval "${_ret}"="${_arch}"
+}
+
+
+get_image_name(){ 
+  local _path2docker_file=$1
+  local _user=$2
+  #DockerFile should be in this format
+  #/bla/bla/ubuntu1404_yocto_base_dependencies.v2.docker"
+  #$distro_function.{TAG}.docker
+  #ret=gandrys/ubuntu1404_yocto_base_dependencies:v2
+  local _ret=$3
+  
+  local _img_name=${_path2docker_file##*/}
+  _img_name=${_img_name%.*}
+  _img_name=${_img_name/./:}
+  _img_name="${_user}/${_img_name}"
+  
+  eval "${_ret}"="${_img_name}"
+}
+
+get_container_name() { 
+  local _path2docker_file=$1
+  local _user=$2
+  #DockerFile should be in this format
+  #/bla/bla/ubuntu1404_yocto_base_dependencies.v2.docker"
+  #$distro_function.{TAG}.docker
+  #img_name=gandrys/ubuntu1404_yocto_base_dependencies:v2
+  #ret=gandrys_ubuntu1404_yocto_base_dependencies_v2
+  local _ret=$3
+  
+  local _img_name=${_path2docker_file##*/}
+  _img_name=${_img_name%.*}
+  _img_name=${_img_name/./:}
+  _img_name="${_user}/${_img_name}"
+  
+  _container_name="${_img_name////_}"
+  _container_name="${_container_name/:/_}"
+  
+  eval "${_ret}"="${_container_name}"
+}
+
+docker_build_yocto_user_image() {
+  local _dcmd=$1
+  local _user_image_name=$2
+  local _user_image_uid=$3
+  local _user_image_gid=$4
+  
+  DOCKER_YOCTO_BUILD_PARAMS=" --build-arg USER_NAME=${_user_image_name} \
+                              --build-arg USER_UID=${_user_image_uid} \
+                              --build-arg USER_GID=${_user_image_gid} \
+                              -f ${YOCTO_USER_DOCKER_FILE} \
+                              -t ${DOCKER_YOCTO_USER_IMG_NAME} \
+                               ${DOCKER_BUILD_DIRECTORY} "
+
+  if [ "${OS_STRING}" != "NATIVE_LINUX" ]; then
+    DOCKER_YOCTO_BUILD_PARAMS=" --build-arg USER_NAME=${_user_image_name} \
+                              --build-arg USER_UID=${_user_image_uid} \
+                              --build-arg USER_GID=${_user_image_gid} \
+                              -f $(cygpath -aw ${YOCTO_USER_DOCKER_FILE}) \
+                              -t ${DOCKER_YOCTO_USER_IMG_NAME} \
+                               $(cygpath -aw ${DOCKER_BUILD_DIRECTORY}) "
+  fi
+                               
+  "${_dcmd}" build ${DOCKER_YOCTO_BUILD_PARAMS}
+  return $?
+}
+
+docker_identify() {
+  local _ret=$1
+  local _dcmd
+
+  is_docker_user=""
+  #{ normal docker or multisession docker ?
+  if [ "${OS_STRING}" = "NATIVE_LINUX" ]; then
+    is_docker_user="$(systemctl is-enabled docker_user@${USER_NAME_HOST}.service 2>/dev/null | grep enabled)"
+  fi
+
+  if [ -z "$is_docker_user" ]; then
+
+    echo -e "  Info: The "'"'docker_user'"' " tools not found, docker will be used.\n"
+    _dcmd="docker"
+    #{ Is daemon running ?
+    tst=$("${_dcmd}" ps); ret=$?
+    if [ "$ret" != "0" ]; then
+     echo -e "  Error: Please start service by command: \n         $ sudo systemctl start docker.service"; return 1
+    fi
+    #}
+  else
+    _dcmd="docker_user"
+    #{ Is daemon running ?
+    tst=$("${_dcmd}" ps); ret=$?
+    if [ "$ret" != "0" ]; then 
+      echo -e "  Error: Please start service by command: \n         $ sudo systemctl start docker_user@${USER_NAME_HOST}.service"; return 1
+    fi
+    #}
+  fi
+  #}  
+  
+  eval "$_ret"=$_dcmd
+}
+
+
+cygwin_vbox_yocto_image_mount() {
+  
+    yn="n"
+    #is yocto environment/image set in virtbox settings ?
+    issetyoctoimg_in_docker_machine=$("${VBOXMANAGE}" showvminfo "${VBOX_DOCKER_MACHINE_NAME}" --machinereadable | egrep "SATA-5-0.*\=.*none")
+    if [ ! -z "${issetyoctoimg_in_docker_machine}" ]; then
+      #img is notset ...ask to path to y image
+      yn="y"
+    else
+      curr_img="$("${VBOXMANAGE}" showvminfo "${VBOX_DOCKER_MACHINE_NAME}" --machinereadable | egrep "SATA-5-0.*\=")"
+      curr_img="${curr_img##*=}"
+      echo -e '  Info: Do you want to mount different image than: "'"${curr_img}"'" ?''[y/n]'
+      read -e  -p "  >" yn
+      echo -e "\n\n"
+    fi  
+    
+    if [ "$yn" == "y" ]; then
+    
+      echo -e "\n  Please enter the path to the yocto-image file:"
+      read -e  -p "  >" path_to_img_file
+
+      if [ ! -f "$path_to_img_file" ] || [ -z "$path_to_img_file" ]; then
+        echo -e "\n  Error: Image file not found !"
+        return 1
+      fi
+
+      #vbox need to have *.hdd extension ...vbox is not reading real header of img-file 
+      israwimg=`echo "$path_to_img_file" | grep -E "\..*raw"`
+      if [ ! -z "$israwimg" ]; then
+        yn="n"
+        echo -e "\n  VirtualBox image have to have *.hdd extension!\n  Do you want to rename image ?[y/n]"
+        read -e  -p "  >" yn
+        if [ "$yn" == "y" ]; then
+          new_img_name="${path_to_img_file%%.*}.hdd"
+          mv "${path_to_img_file}" "${new_img_name}"
+          sleep 1
+          path_to_img_file="${new_img_name}"
+        else 
+          return 1
+        fi
+            
+      fi
+  
+      echo -e "\n\n"
+      bla=$(docker-machine stop "${VBOX_DOCKER_MACHINE_NAME}" )
+      sleep 0.5
+      
+      win_img_path=$(cygpath -aw "${path_to_img_file}" )
+      #set image file
+      bla=$("${VBOXMANAGE}" storageattach "${VBOX_DOCKER_MACHINE_NAME}" --storagectl "SATA" --port 5 --device 0 --type "hdd" --medium "${win_img_path}" )
+      sleep 0.5
+      
+    fi 
+    
+    docker-machine start "${VBOX_DOCKER_MACHINE_NAME}"
+    sleep 0.5
+    eval $(docker-machine env "${VBOX_DOCKER_MACHINE_NAME}")
+    sleep 0.5
+    #volumes are persistent, after docker machine restart 
+    bla=$(docker-machine ssh docker volume rm "${VBOX_YOCTO_VOLUME_NAME}" )
+    
+    #in case that we will not restart docker machine, mount point will remain, now we try to unmount
+    bla=$(docker-machine ssh "${VBOX_DOCKER_MACHINE_NAME}" "sudo umount /mnt/sdb1" &>/dev/null)
+    sleep 0.5
+    echo -e "\n\n"
+    
+    
+    bla=$(docker-machine ssh "${VBOX_DOCKER_MACHINE_NAME}" "sudo mount /dev/sdb1")
+    ret=$?
+    if [ "${ret}" != "0" ]; then
+      echo -e "\n  Error: Unable to mount Yocto image in docker-machine!\n "
+      echo -e "         Press Enter to continue"
+      read 
+      return 1
+    fi
+      
+    user_name_image=$(docker-machine ssh "${VBOX_DOCKER_MACHINE_NAME}" "ls /mnt/sdb1/opt/" 2>/dev/null)
+    ret1=$?
+    worksdir=$(docker-machine ssh "${VBOX_DOCKER_MACHINE_NAME}" "ls /mnt/sdb1/opt/${user_name_image}/" 2>/dev/null)
+    ret2=$?
+    if [ "$ret1" != "0" ] || [ "$ret2" != "0" ] || [ -z "${user_name_image}" ] || [ -z "${worksdir}" ] ; then
+      echo -e "\n  Error: Image does not have necessary directory structure! \n"
+      echo -e "         Press Enter to continue"
+      read 
+      return 1
+    fi
+    
+    bla=$(docker-machine ssh "${VBOX_DOCKER_MACHINE_NAME}" "docker volume create --name ${VBOX_YOCTO_VOLUME_NAME} --opt type=none --opt device=/mnt/sdb1/opt --opt o=bind ")
+    ret=$?
+    if [ "${ret}" != "0" ]; then
+      echo -e "\n  Error: Unable to create docker volume !\n "
+      echo -e "         Press Enter to continue"
+      read 
+      return 1
+    fi
+    
+    return 0
+}
+
+#yocto image with yocto env is not mounted within local win system, 
+#but it will be directly mounted  within docker-machine 
+cygwin_vbox_yocto_image_mount_test() {
+  local _ret_image_user_name=$1
+  local _ret_image_user_uid=$2
+  local _ret_image_user_gid=$3
+  
+  while true; do
+    cygwin_vbox_yocto_image_mount
+    ret=$?
+    if [ "${ret}" != "0" ]; then
+      echo -e "\n\n"
+      continue
+    else
+      break;
+    fi
+  done
+  eval $(docker-machine env "${VBOX_DOCKER_MACHINE_NAME}")
+  
+  tmp=$(docker-machine ssh "${VBOX_DOCKER_MACHINE_NAME}" "ls /mnt/sdb1/opt/" 2>/dev/null)
+  eval "${_ret_image_user_name}"="${tmp}"
+  
+  tmp=( $(docker-machine ssh "${VBOX_DOCKER_MACHINE_NAME}" "ls -lnd /mnt/sdb1/opt/${tmp}" 2>/dev/null) )
+  eval "${_ret_image_user_uid}"="${tmp[2]}"
+  eval "${_ret_image_user_gid}"="${tmp[3]}"
+  
+}
+
+
+#multiple user directories in /mnt/${USER_NAME_HOST}/vd0/opt are not supproted !!!
+yocto_image_mount_test() {
+  local _ret_image_user_name=$1
+  local _ret_image_user_uid=$2
+  local _ret_image_user_gid=$3
+  
+  while true; do
+    ismounted=$(mount | egrep "dev.*mapper.*loop.*p1.*on.*mnt.*${USER_NAME_HOST}.*vd0" )
+    if [ -z "${ismounted}" ]; then
+      echo -e "  Error: Please mount yocto image first by command:\n       ymount -i=0"
+      echo -e "         Do you want mount image by "'"''ymount''"'" tool and find yocto image ?[y/n]"
+      read -p "         >" yn
+      if [ "$yn" == "y" ]; then 
+       ${YOCTO_IMAGE_MOUNT_COMMAND_NO_OPT}
+       ret=$?
+       [ "$ret" != "0" ] && continue
+      else
+        exit 1
+      fi
+    fi
+    
+    #Fresh and un-prepared image ?
+    #-> if yes, call YOCTO_IMAGE_MOUNT_COMMAND without -n parameter, therefore allow detection of
+    #empty image and creation of directories in image by ymount tool
+    tmp=$(ls /mnt/${USER_NAME_HOST}/vd0/opt 2>/dev/null)
+    ret=$?
+    if [ "$ret" != "0" ] || [ -z "${tmp}" ] ; then
+      echo -e "\n  Error: Image does not have necessary directory structure,\n         ymount tool will be called again with different parameters. "
+      echo -e "         Press Enter to continue"
+      read -p "         >" 
+      ${YOCTO_IMAGE_MOUNT_COMMAND_NO_OPT} unmount
+      sleep 5
+      echo -e "\n--"
+      ${YOCTO_IMAGE_MOUNT_COMMAND}
+      ret=$?
+      [ "$ret" != "0" ] && continue
+    fi
+    break
+  done  
+  
+  tmp=$(ls /mnt/${USER_NAME_HOST}/vd0/opt 2>/dev/null)
+  eval "${_ret_image_user_name}"="${tmp}"
+  
+  tmp=( $(ls -lnd /mnt/${USER_NAME_HOST}/vd0/opt 2>/dev/null) )
+  eval "${_ret_image_user_uid}"="${tmp[2]}"
+  eval "${_ret_image_user_gid}"="${tmp[3]}"
+    
+}
+
+select_file() {
+  local _ftype=$1
+  local _searchdir=$2
+  local _ret_selected=$3
+
+  echo -e "\n  Available files:"
+
+  i=0
+  for fle in "${_searchdir}"/$_ftype; do
+    [ ! -f "${fle}" ] && continue
+    flearr+=("${fle}")
+    echo "    [$i] :""${fle}"
+    i=$((i+1))
+  done
+
+  echo "  Please select file number:"
+  read  -p "  >" selected
+  eval "${_ret_selected}"="${flearr[$selected]}"
+  echo -e "  >"'"'"${flearr[$selected]##*/}"'"'
+  echo -e "  --\n"
+
+}
+
+#This function take a look to "from" field in yocto_user_docker_file and return yocto_base_docker_filepath in docker_files_dir
+get_yocto_base_docker_file(){
+  local _yocto_user_docker_file=$1
+  local _yocto_docker_files_dir=$2
+  local _ret=$3
+
+  #$2=gandrys/ubuntu14045_yocto_base:v5
+  _tmp_dckrfile_from=$(awk '{if($1=="FROM"){print $2; }}' "${_yocto_user_docker_file}")
+  #cut name
+  _tmp0="${_tmp_dckrfile_from##*/}"
+  #get version
+  _dckrimgver=${_tmp_dckrfile_from##*:}
+  _yocto_usr_img_flename="${_tmp0%:*}.${_dckrimgver}.docker"
+
+  #delete last slash
+  _yocto_docker_files_dir="${_yocto_docker_files_dir%/}"
+
+  _yct_base_img_filepath=""
+  #search for file in directory
+  if [ -e "${_yocto_docker_files_dir}/${_yocto_usr_img_flename}" ]; then
+    _yct_base_img_filepath="${_yocto_docker_files_dir}/${_yocto_usr_img_flename}"
+  fi
+
+  eval "${_ret}"="${_yct_base_img_filepath}"
+}
+
+yocto_run() {
+  local _yocto_user_docker_file=$1
+  local _yocto_docker_files_dir=$2
+  local _yocto_tmp_install_dir=$3
+
+  YOCTO_USER_DOCKER_FILE="${_yocto_user_docker_file}"
+  echo -e "Yocto : \n"
+
+  get_yocto_base_docker_file "${_yocto_user_docker_file}" "${_yocto_docker_files_dir}" YOCTO_BASE_DOCKER_FILE
+
+  if [ "${OS_STRING}" != "NATIVE_LINUX" ]; then
+    cygwin_vbox_yocto_image_mount_test USER_NAME_IMAGE USER_UID_IMAGE USER_GID_IMAGE
+  else
+    yocto_image_mount_test USER_NAME_IMAGE USER_UID_IMAGE USER_GID_IMAGE
+  fi
+
+  echo -e "  IMAGE_USER_NAME : ${USER_NAME_IMAGE}"
+  echo -e "  IMAGE_USER_UID  : ${USER_UID_IMAGE}"
+  echo -e "  IMAGE_USER_GID  : ${USER_GID_IMAGE}\n"
+
+  echo -e "  DOCKER_FILES    : ${YOCTO_USER_DOCKER_FILE##*/}->${YOCTO_BASE_DOCKER_FILE##*/}\n"
+  #echo -e "  YOCTO_BASE_DOCKER_FILE=${YOCTO_BASE_DOCKER_FILE}"
+  #echo -e "  YOCTO_USER_DOCKER_FILE=${YOCTO_USER_DOCKER_FILE}"
+
+  get_image_name "${YOCTO_BASE_DOCKER_FILE}" "gandrys" DOCKER_YOCTO_BASE_IMG_NAME
+  get_image_name "${YOCTO_USER_DOCKER_FILE}" "${USER_NAME_IMAGE}" DOCKER_YOCTO_USER_IMG_NAME
+  get_container_name "${YOCTO_USER_DOCKER_FILE}" "${USER_NAME_IMAGE}" DOCKER_YOCTO_USER_CONTAINER_NAME
+
+  #docker_YOCTO_BASE archives files(*.tar.bz2) exist in docker temp file (_yocto_tmp_install_dir)
+  #These archives files(*.tar.bz2) are always temporary and are removed  after load to docker "filesystem"
+  get_base_image_archive_path "${_yocto_tmp_install_dir}" "${YOCTO_BASE_DOCKER_FILE}" YOCTO_BASE_IMAGE_FILE
+
+  #{ normal docker or multisession docker ?
+  docker_identify dcmd
+  ret=$?
+  [ "${ret}" != "0" ] && return 1
+  
+  #ng_path:container->user_image->base_image->archive_base_image->error
+
+  if [ "${OS_STRING}" == "NATIVE_LINUX" ]; then
+   selinux_mnt_enable
+  fi
+  
+  
+  DOCKER_YOCTO_RUN_PARAMS=" --rm -t -i -e DISPLAY \
+                            -v /mnt/${USER_NAME_HOST}/vd0/opt:/opt \
+                            -v /tmp/.X11-unix:/tmp/.X11-unix \
+                            -v /home/${USER_NAME_HOST}/.Xauthority:/home/${USER_NAME_IMAGE}/.Xauthority \
+                            --name ${DOCKER_YOCTO_USER_CONTAINER_NAME} \
+                            --user ${USER_NAME_IMAGE} \
+                            ${DOCKER_YOCTO_USER_IMG_NAME} \
+                             /bin/bash"
+
+
+  #due to remote access and virtual X11 displays x11 disp id is changing,
+  #moreover user can run env from ssh or from gui and DISPLAY variable is not set in case of ssh,
+  #therefore, we need always run docker run -e DISPLAY
+  #first_yocto_run=$("$dcmd" ps -a |  egrep "${DOCKER_YOCTO_USER_CONTAINER_NAME}")
+
+  #if [ -z "$first_yocto_run" ]; then
+
+    #check if docker_YOCTO_USER image exist user/XX_docker_user:vX
+    docker_yocto_user_img=$("$dcmd" images | egrep "${DOCKER_YOCTO_USER_IMG_NAME%:*}".*"${DOCKER_YOCTO_USER_IMG_NAME#*:}")
+    if [ -z "$docker_yocto_user_img" ]; then
+
+      #check if docker_YOCTO_BASE image exist user/XX_docker_user:vX
+      docker_yocto_base_img=$("$dcmd" images | egrep "${DOCKER_YOCTO_BASE_IMG_NAME%:*}".*"${DOCKER_YOCTO_BASE_IMG_NAME#*:}")
+      if [ -z "$docker_yocto_base_img" ]; then
+
+        #check if docker_YOCTO_BASE archive file(*.tar.bz2) exist in docker temp file
+        if [ ! -e "${YOCTO_BASE_IMAGE_FILE}" ]; then
+          echo -e "\n\nWarning: Tar.bz2 archive ${YOCTO_BASE_IMAGE_FILE} does not exist.\n         Create Yocto Base Image?[y/n]"
+          read -p "        >" yn
+          if [ "$yn" == "y" ]; then
+            create_docker_image_archive_yocto_base "${YOCTO_BASE_DOCKER_FILE}" "${YOCTO_BASE_IMAGE_FILE}" "${DOCKER_YOCTO_BASE_IMG_NAME}" "${DOCKER_BUILD_DIRECTORY}"
+            ret=$?
+            [ "$ret" != "0" ] && return 1
+            echo ""
+          else 
+            echo -e "Exiting"
+            return 1
+          fi
+        fi
+        
+        #if only tar exist skip Decompression
+        if [ ! -f "${YOCTO_BASE_IMAGE_FILE%.bz2*}" ]; then
+         #tar does not exist ...> decompress
+          echo -e "  Docker Base Yocto Image: Decompression  \n"
+          echo -e "    Press ENTER to continue : "
+          read -p "    >" 
+          #remove original tar.bz2 archive automatically 
+          bunzip2 -fvv "${YOCTO_BASE_IMAGE_FILE}"
+          ret=$?
+          if [ "${ret}" != "0" ]; then 
+            echo -e "\n\nError: Decompression of ${YOCTO_BASE_IMAGE_FILE} failed !"
+            return 1
+          fi 
+        fi
+        
+        echo -e "  Docker Base Yocto Image: docker load "${YOCTO_BASE_IMAGE_FILE%.bz2*}"  \n"
+        echo -e "    Press ENTER to continue : "
+        read -p "    >"         
+        if [ "${OS_STRING}" != "NATIVE_LINUX" ]; then
+          "${dcmd}" load -i $(cygpath -aw "${YOCTO_BASE_IMAGE_FILE%.bz2*}" )
+          ret=$?
+        else
+          "${dcmd}" load -i "${YOCTO_BASE_IMAGE_FILE%.bz2*}"
+          ret=$?
+        fi
+
+        if [ "${ret}" == "0" ]; then 
+          #remove tar archive after proper load
+          rm "${YOCTO_BASE_IMAGE_FILE%.bz2*}"
+        fi 
+        
+        echo -e "\n\n"
+      fi
+      
+      echo -e "  Docker Build User Yocto Image: \n"
+      echo -e "  Virtual environment will be created, press ENTER to continue : "
+      read -p "  >" 
+      docker_build_yocto_user_image "${dcmd}" "${USER_NAME_IMAGE}" "${USER_UID_IMAGE}" "${USER_GID_IMAGE}"
+    fi
+    
+    
+    #check if container exist -a param is necessary(all containers) 
+    cntexist=$("${dcmd}" ps -a -f name="${DOCKER_YOCTO_USER_CONTAINER_NAME}" -q)
+    if [ ! -z "${cntexist}" ]; then
+      #container exist > running ? -> delete ?
+      
+      #check if container is running
+      cntisrunning=$("${dcmd}" ps -f name="${DOCKER_YOCTO_USER_CONTAINER_NAME}" -f status=running -q )
+      if [ ! -z "${cntisrunning}" ]; then
+        #container is running
+        echo -e "\n\n  Warning: Container ${DOCKER_YOCTO_USER_CONTAINER_NAME} is running ! "
+        echo -e "         Do you want to stop this container ? [y/n]"
+        read -p "         >" yn
+      
+        if [ "$yn" = "y" ]; then
+          bla=$("${dcmd}" stop "${DOCKER_YOCTO_USER_CONTAINER_NAME}")
+        else
+          echo -e "Exiting"
+          return 1
+        fi
+      fi
+      
+      
+      echo -e "\n\n  Warning: Container "'"'${DOCKER_YOCTO_USER_CONTAINER_NAME}'"' " should not exist."
+      echo -e "         Do you want to delete this container ? [y/n]"
+      read -p "         >" yn
+      if [ "$yn" = "y" ]; then
+        bla=$("${dcmd}" rm "${DOCKER_YOCTO_USER_CONTAINER_NAME}")
+      else
+        echo -e "Exiting"
+        return 1
+      fi
+      
+    fi
+    
+    echo -e "  Info: Docker run \n"
+    
+    if [ "${OS_STRING}" != "NATIVE_LINUX" ]; then
+      DOCKER_YOCTO_RUN_PARAMS=" --rm -t -i -e DISPLAY \
+                                -v ${VBOX_YOCTO_VOLUME_NAME}:/opt \
+                                --name ${DOCKER_YOCTO_USER_CONTAINER_NAME} \
+                                --user ${USER_NAME_IMAGE} \
+                                ${DOCKER_YOCTO_USER_IMG_NAME} "  
+
+      #cygstart and cmd is necessary here due to cygwin's terminal which do not support full posix tty 
+      echo -e "\n  Info: Run in separate window"
+      
+      cygstart cmd /C "${dcmd} run ${DOCKER_YOCTO_RUN_PARAMS}"
+    else
+      "${dcmd}" run ${DOCKER_YOCTO_RUN_PARAMS}
+    fi
+    
+  #else
+  #  echo -e "  Info: $ Docker start ${DOCKER_YOCTO_USER_CONTAINER_NAME} \n"
+  #  "${dcmd}" start -ai ${DOCKER_YOCTO_USER_CONTAINER_NAME}
+  #fi
+  #}
+
+}
+
+
+update_script_data() {
+  local _files=$1
+  local _src_dir=$2
+  declare -a _instfiles=( $_files )
+  _src_dir="${_src_dir%/}"
+  if [ ! -z "$_src_dir" ]; then
+    _src_dir="${_src_dir}""/"
+  fi
+
+  awk '{print $0; if( $0 == "BASE64_DATA_FILES:" ){exit} }' ${fname} > ${release_fname}
+
+  echo -e "Update file: "
+  for fle in ${_instfiles[@]}; do
+    echo -e "  File: ${fle##*/}"
+    src_file="${_src_dir}""${fle##*/}"
+
+    if [ -f ${src_file} ]; then
+    
+      if [ "${fle}" == "${YOCTO_BASE_IMAGE_FILE}" ] && [ "${ADD_BASE_IMAGE}" == "no" ] ; then
+        echo "    >skip"
+        echo -e "SKIP:" >>"${release_fname}"
+        echo -e "" >>"${release_fname}"
+        continue      
+      fi
+      
+      echo "    >OK"
+      
+      fle_encoded=$(base64 ${src_file})
+      echo -e "${fle_encoded}" >>"${release_fname}"
+      echo -e "" >>"${release_fname}"
+    else
+      if [ "${fle}" == "${YOCTO_BASE_IMAGE_FILE}" ] && [ "${ADD_BASE_IMAGE}" == "no" ] ; then
+        echo "    >skip"
+        echo -e "SKIP:" >>"${release_fname}"
+        echo -e "" >>"${release_fname}"
+        continue
+      fi
+    
+      echo "     >Error: File not found" 
+      exit 1
+    fi
+    
+  done
+  
+}
+
+
+#for release phase
+#all files should be in current directory,
+# docker files will be
+update_script_data2() {
+  local _base_release_files=$1
+  local _src_dir=$2
+  local _docker_build_dir=$3
+  local _tmp_install_dir=$4
+
+  #this var includes only base files(ymount, ycimg. etc), docker files and docker archived images are not listed here
+  #we will search current directory for docker files and docker archived images
+  declare -a _arr_base_release_files=( ${_base_release_files} )
+
+  #"">./
+  #"./">"./"
+  #"/">"/"
+  if [ -z "$_src_dir" ]; then
+    _src_dir="./"
+  else
+    _src_dir="${_src_dir%/}"
+    _src_dir="${_src_dir}""/"
+  fi
+
+  awk '{print $0; if( $0 == "BASE64_DATA_FILES:" ){exit} }' ${fname} > ${release_fname}
+
+  echo -e "Adding static files: "
+  for fle in ${_arr_base_release_files[@]}; do
+    echo -e "  File: ${fle##*/}"
+    src_file="${_src_dir}""${fle##*/}"
+
+    if [ -f ${src_file} ]; then
+      fle_encoded=$(base64 ${src_file})
+      echo "    >OK"
+      echo -e "${fle}" >>"${release_fname}"
+      echo -e "${fle_encoded}" >>"${release_fname}"
+      echo -e "" >>"${release_fname}"
+    else
+      echo "     >Error: File not found"
+      exit 1
+    fi
+  done
+
+  echo -e "\n\nAdding dynamic files: "
+  echo -e "\n  Searching docker files:"
+  #search only *.docker files and will not list *.docker.tar.bz2 files
+  for fle in "${_src_dir%/}"/*".docker"; do
+    [ ! -f "${fle}" ] && continue
+    dckr_file_path="${_docker_build_dir}/${fle##*/}"
+    echo -e "    File: ${fle##*/}"
+    fle_encoded=$(base64 ${fle})
+    echo -e "      >OK"
+    echo -e "${dckr_file_path}" >>"${release_fname}"
+    echo -e "${fle_encoded}" >>"${release_fname}"
+    echo -e "" >>"${release_fname}"
+  done
+
+
+  #It is better to add bigger files on the end of file, because of later we can easily remove it
+  #I dont want add docker fle and archive close each other in this file, it will be more difficult to remove big file ..
+  #error in this case
+  if [ "${ADD_BASE_IMAGE}" == "yes" ]; then
+    #buntu14045_yocto_base.v4.docker.tar.bz2
+    echo -e "\n  Searching docker archives *yocto_base.v*.*docker.tar.gz2"
+    for fle in "${_src_dir%/}"/*"_yocto_base.v"*".docker.tar.bz2"; do
+      [ ! -f "${fle}" ] && continue
+      #check if we have corresponding docker file, if not ...continue with searching ...
+
+      [ ! -f "${fle%.tar.bz2*}" ] && continue
+
+      dckr_file_dstpath="${_tmp_install_dir}/${fle##*/}"
+      echo -e "    File: ${fle##*/}"
+      fle_encoded=$(base64 ${fle})
+      echo -e "${dckr_file_dstpath}">>"${release_fname}"
+      echo "${fle_encoded}">>"${release_fname}"
+      echo -e "      >OK"
+      echo -e "" >>"${release_fname}"
+      unset fle_encoded
+      sleep 1
+    done
+  fi
+
+  return 0;
+}
+
+#Recreate files in base64 format from data in the end of yocto script.
+#Not all files in list have to be re-created in case of SKIP: in data then file is skiped
+recreate_file() {
+  local _filesinstorage=$1
+  local _recfile=$2
+  local _dest_directory=$3
+
+  if [ ! -z "${_dest_directory}" ]; then
+    if [ ! -e "${_dest_directory}" ]; then
+      if [ ! -f "${_dest_directory}" ]; then
+        mkdir -p "${_dest_directory}"
+      else
+        echo "  Error: Can not create the same folder name and file name in the same directory "
+        return 1
+      fi
+    fi
+    _dest_directory="${_dest_directory%/}"
+    _dest_directory="${_dest_directory}/"
+  fi
+  
+  data_src_file="${fname}"
+  
+  fle_index=0;
+  for fle in ${_filesinstorage[@]}; do
+    ((file_index+=1))
+    export file_index
+    if [ "${fle##*/}" == "${_recfile}" ]; then
+      base64_filedata=$(awk -v fle_index=$file_index 'BEGIN { data_part = 0 }{if(data_part == fle_index ){ print $0 }; if(($0 == "BASE64_DATA_FILES:")||(data_part>0 && $0 == "" )){ data_part+=1;} }' "${data_src_file}")
+      echo "${base64_filedata}" | base64 -d >"${_dest_directory}${fle##*/}"
+    fi
+  done
+  
+  return 0;
+  
+}
+
+#Recreate files in base64 format from data in the end of yocto script.
+#Not all files in list have to be re-created in case of SKIP: in data then file is skiped
+recreate_files() {
+  local _files=$1
+  declare -a _instfiles=( $_files )
+
+  echo -e "\nRe-create files :"
+  
+  if [ ! -e "${TEMP_INSTALLATION_DIRECTORY}" ]; then
+    if [ ! -f "${TEMP_INSTALLATION_DIRECTORY}" ]; then
+      mkdir -p "${TEMP_INSTALLATION_DIRECTORY}"
+    else
+      echo "  Error: Can not create the same folder name and file name in the same directory "
+      return 1
+    fi
+  fi
+
+  data_src_file="${fname}"
+  
+  fle_index=0;
+  for fle in ${_instfiles[@]}; do
+    echo -e "  ""$fle"
+    ((file_index+=1))
+    export file_index
+    
+    base64_filedata=$(awk -v fle_index=$file_index 'BEGIN { data_part = 0 }{if(data_part == fle_index ){ print $0 }; if(($0 == "BASE64_DATA_FILES:")||(data_part>0 && $0 == "" )){ data_part+=1;} }' "${data_src_file}")
+    if [ -z "${base64_filedata}" ]; then
+      echo -e "  Error: No data in $data_src_file file !"
+      return 1
+    fi
+    
+    if [ "${base64_filedata}" == "SKIP:" ]; then 
+      echo -e "    >Skip: No data in data array"
+      echo -e "      >Find file in local folder:"
+      fnameonly="${fle##*/}"
+      if [ -e "${fnameonly}" ]; then
+        echo -e "        >Found, copying to ${TEMP_INSTALLATION_DIRECTORY} directory. "
+        cp "${fnameonly}" "${TEMP_INSTALLATION_DIRECTORY}""/""${fle##*/}"
+      else
+        echo -e "      >Not Found"
+      fi
+      continue
+    fi
+    
+    echo "${base64_filedata}" | base64 -d >"${TEMP_INSTALLATION_DIRECTORY}""/""${fle##*/}"
+    
+  done
+  
+  return 0;
+}
+
+
+
+#Crazily slow in case of big files 10 min was not enough for cca 300MB base64 file
+#Recreate files in base64 format from data in the end of yocto script.
+#and return list(string with spaces) of all base64 files
+recreate_files2() {
+
+  local _data_src_file=$1
+  local _tmp_inst_dir=$2
+  local _ret="$3"
+
+  declare -a _arr_data_fles
+  declare -a _eval_datafles
+
+  echo -e "\nRe-create files :"
+  export _tmp_inst_dir
+
+
+  if [ ! -e "${_tmp_inst_dir}" ]; then
+    if [ ! -f "${_tmp_inst_dir}" ]; then
+      mkdir -p "${_tmp_inst_dir}"
+    else
+      echo "  Error: Can not create the same folder name and file name in the same directory "
+      return 1
+    fi
+  fi
+
+  #extraction of file names and paths
+  data_fles=$(awk 'BEGIN { data_part = 0; name_only=0 }{
+    ##names only
+    if(data_part&&name_only){
+      print $0
+      name_only=0
+    };
+    if(($0 == "BASE64_DATA_FILES:")||(data_part>0 && $0 == "" )){
+      data_part+=1;
+      name_only=1;
+    };
+  }' "${_data_src_file}")
+  _arr_data_fles=( ${data_fles} )
+
+  #file paths in data_fles varialbes have variables insides ...eval $user
+  for fle in ${_arr_data_fles[@]}; do
+    _eval_datafles+=($(eval echo "${fle}"))
+    _eval_datafles_ret="${_eval_datafles_ret}"" ""$(eval echo "${fle}")"
+  done
+
+  file_index=0;
+  for fle in ${_eval_datafles[@]}; do
+    echo -e "  ""$fle"
+    ((file_index+=1))
+    export file_index
+
+    #TODO:This is slow: Later>optimalization>decrease numbers of branches...
+    base64_filedata=$(awk -v fle_index=$file_index 'BEGIN { data_part = 0; name_only=0 }{
+      if(data_part == fle_index && name_only==0 && $0!=""){ print $0 };
+      if(data_part&&name_only){ name_only=0 };
+      if(($0 == "BASE64_DATA_FILES:")||(data_part>0 && $0 == "" )){data_part+=1;name_only=1}
+    }' "${_data_src_file}")
+    if [ -z "${base64_filedata}" ]; then
+      echo -e "  Error: No data in $data_src_file file !"
+      return 1
+    fi
+
+    echo "${base64_filedata}" | base64 -d >"${TEMP_INSTALLATION_DIRECTORY}""/""${fle##*/}"
+    unset base64_filedata
+    sleep 0.1
+
+  done
+
+  eval "${_ret}"='${_eval_datafles_ret}'
+
+  #this implemetation is crazily slow !!!!! imposible to use for big base64 files with size >1MB
+  #data_fles=$(awk -v tmp_inst_dir=$_tmp_inst_dir 'BEGIN { data_part = 0; name_only=0; cnti=0 }{
+  #  if(data_part && name_only==0 && $0!=""){
+  #    tmp=cnti-1
+  #    arr_data[tmp]=arr_data[tmp]$0
+  #  };
+  #  ##names only
+  #  if(data_part&&name_only){
+  #    ##print $0
+  #    fpaths[cnti]=$0
+  #    name_only=0
+  #    cnti+=1
+  #  };
+  #  if(($0 == "BASE64_DATA_FILES:")||(data_part>0 && $0 == "" )){
+  #    data_part+=1;
+  #    name_only=1;
+  #  };
+  #}END{
+  #  for(i=0;i<cnti;i++){
+  #    tmpcnt=split(fpaths[i],a,"/",sep); fname=a[tmpcnt]
+  #    cmd="echo "arr_data[i]" |base64 -d >"tmp_inst_dir"/"fname
+  #    errval=system(cmd)
+  #    if(errval!=0){
+  #      print "\nError:{ "fname", errval="errval"}"
+  #      exit 1
+  #    }else{
+  #      print fpaths[i]
+  #    }
+  #  }
+  #}' "${_data_src_file}")
+
+  #_errval=$?
+  #if [ "${_errval}" != "0" ]; then
+  #  echo "Error: recreate_files(): "
+  #  echo $(echo "${data_fles}" | grep "Error")
+  #  return 2
+  #else
+  #   eval "${_ret}"='${data_fles}'
+  #fi
+
+  return 0;
+}
+
+
+cp_docker_archives_to_usr_dir(){
+  local _data_files=$1
+  declare -a _arr_data_files=( ${_data_files} )
+  local _tmp_inst_dir=$2
+
+  echo -e "\nSearching archives of base images(*yocto_base.v*.docker.tar.bz2) file :"
+
+  #searching in list of base64 data files,
+  # if in list only yocto_base*.docker > search in local fldr related archive files and cpy them to tmp_inst_dir
+  #  > rewrite the one in users"s folder by one in local folder
+
+  for fle in ${_arr_data_files[@]}; do
+    fnameonly="${fle##*/}"
+
+    _dckrfle=$(echo ${fnameonly} | egrep yocto_base\..*v\..*docker)
+
+    if [ ! -z "${_dckrfle}" ]; then
+      echo "  ""${fnameonly}.tar.bz2"
+    else
+      continue
+    fi
+
+    echo -e "    >Find file in local folder:"
+    if [ -e "${fnameonly}.tar.bz2" ]; then
+      echo -e "      >Found, copying to ${_tmp_inst_dir} directory. "
+      cp -f "${fnameonly}.tar.bz2" "${_tmp_inst_dir}""/"
+    else
+      echo -e "      >Not Found"
+    fi
+
+  done
+
+}
+
+
+
+cygwin_vboxinstall() {
+  local _mainlink="http://download.virtualbox.org/virtualbox/"
+  local _ver=$(curl "${_mainlink}LATEST.TXT" )
+  local _lstver_dir="${_mainlink}${_ver}"
+  local _pkglst=$(curl "${_lstver_dir}" | grep exe)
+  local _tmp="${_pkglst%%exe*}exe"
+  local _pkgname=${_tmp##*=}
+  local _pkgname=${_pkgname/\"/}
+  local _dlink="${_mainlink}${_ver}/${_pkgname}"
+  
+  echo -e "\nDownloading VirtualBox:\n"
+  curl -O "${_dlink}"
+  echo -e "\n"
+  sleep 1
+  chmod +x ./${_pkgname}
+  
+  echo -e "\nInstalling VirtualBox:\n"
+  ./${_pkgname}
+  
+}
+
+cygwin_install_chocolatey() {
+
+  #ischocolatey installed ?
+  bla=$(choco)
+  ret=$?
+  #if choco is started with no params return 1
+  [ ${ret} == "1" ] && return 0;
+
+  echo -e "          This console have to be in privileged mode "
+  echo -e "          Press Enter to continue"
+  read -p "          >"
+      
+  echo -e "\n\nChocolatey Installation: \n"
+  echo -e "  Change Execution Rules to RemoteSigned : \n"
+  echo -e "\n" | powershell -NoProfile -Command "Set-ExecutionPolicy -ExecutionPolicy RemoteSigned"
+      
+  echo -e "  Docker Installation from Chocolatey repo: \n"
+  echo -e "\n" | powershell -NoProfile -ExecutionPolicy Bypass -Command "iex ((New-Object System.Net.WebClient).DownloadString('https://chocolatey.org/install.ps1'))"
+
+}
+
+cygwin_install_docker() {
+
+  #isdocker installed ?
+  bla=$(docker -v)
+  ret=$?
+  #if docker is started with -v param return 0
+  [ ${ret} == "0" ] && return 0;
+  
+  echo -e "\n\nDocker client from Chocolatey repo: \n"
+  cmd /c "choco install docker"
+  echo -e "\n\n"
+  
+}
+
+cygwin_install_docker_machine() {
+
+  #isdocker installed ?
+  bla=$(docker-machine -v)
+  ret=$?
+  #if docker is started with -v param return 0
+  [ ${ret} == "0" ] && return 0;
+
+  echo -e "\n\nDocker machine from Chocolatey repo: \n"
+  cmd /c "choco install docker-machine"
+  echo -e "\n\n"
+  
+}
+
+#to run this we have to have sudo rights for manipulation with /etc/sudoers
+set_sudoers() {
+
+  sudoerr_file="/etc/sudoers"
+  sudoerr_incldir="/etc/sudoers.d"
+  sudoerr_inclusrfile="${sudoerr_incldir}/yocto-tools_${USER_NAME_HOST}"
+
+  if [ ! -f "${sudoerr_file}" ]; then
+    echo -e "ERROR: Unable to find sudoers file. Exiting"
+    exit
+  fi
+
+  #check if general /etc/sudoers includes sycimg symount commands if not > add
+  subsystfiles_in_sudoers=$(sudo bash -c "cat "${sudoerr_file}" | egrep yocto-tools.*sycimg.*symount")
+  if [ -z "${subsystfiles_in_sudoers}" ]; then
+     sudo bash -c "echo -e \%yocto-tools   ALL\=NOPASSWD:  /usr/local/bin/sycimg, /usr/local/bin/symount >>"${sudoerr_file}" "
+  fi
+
+
+
+  if [ "${INSTALL_SERVICES}" != "yes" ]; then
+    return 0;
+  fi
+
+  #check if #includedir /etc/sudoers.d exist if not add and create directory
+  includedir_in_sudoers=$(sudo bash -c "cat "${sudoerr_file}" | egrep '\#includedir'.*'/etc/sudoers.d'")
+  if [ -z "${includedir_in_sudoers}" ]; then
+     sudo install -m 755 -d /etc/sudoers.d
+     sudo bash -c "echo -e \#includedir /etc/sudoers.d >>"${sudoerr_file}" "
+  fi
+
+  #add services related commands
+  if [ -f "${sudoerr_inclusrfile}" ]; then
+    echo -e "\nWarning: Sudoerrs file for given user already exist and will be erased"
+    sudo rm "${sudoerr_inclusrfile}"
+  fi
+
+  sudo bash -c "echo -e  "${USER_NAME_HOST}"  ALL\=NOPASSWD:  /bin/systemctl start docker_user@"${USER_NAME_HOST}".service >>${sudoerr_inclusrfile}"
+  sudo bash -c "echo -e  "${USER_NAME_HOST}"  ALL\=NOPASSWD:  /bin/systemctl stop  docker_user@"${USER_NAME_HOST}".service >>${sudoerr_inclusrfile}"
+  sudo bash -c "echo -e  "${USER_NAME_HOST}"  ALL\=NOPASSWD:  /bin/systemctl stop  mounts_disconects@"${USER_NAME_HOST}".timer >>${sudoerr_inclusrfile}"
+  sudo bash -c "echo -e  "${USER_NAME_HOST}"  ALL\=NOPASSWD:  /bin/systemctl start mounts_disconects@"${USER_NAME_HOST}".timer >>${sudoerr_inclusrfile}"
+
+}
+
+install_files() {
+  local _files=$1
+  declare -a _instfiles
+  declare -a _ssfiles=( $2 )
+  local _tmp_install_dir=$3
+
+  local _tmp_buildmachine_new_template="no"
+
+  local _tmp_skip="false"
+  
+  if [ "${OS_STRING}" != "NATIVE_LINUX" ]; then
+    
+    echo -e "Windows system preparation: "
+    
+    #VirtualBox(try install )->
+    #exit script in case of error, if Vbox is found >return
+    cygwin_get_vboxclitool
+    ret=$?
+    if [ "${ret}" != "0" ]; then
+      cygwin_vboxinstall
+      cygwin_get_vboxclitool
+      ret=$?
+      [ "${ret}" != "0" ] && exit 1
+    fi
+    
+    if [ "${IS64BIT}" == "n" ]; then
+      #In case of 32 bit win, we need to install docker from chocolatey
+      #Chocolatey(install)->choco docker install
+      #Docker machine
+      echo -e " Windows: Docker engine is not distributed in default docker repo in 32 bit version !"
+      echo -e "          Because of that we need to install docker from Cocolatey repo"
+    else
+      echo -e " Windows: Docker engine and docker-machine will be installed by Chocolatey repo !"
+    fi
+    
+    cygwin_install_chocolatey
+      
+    cygwin_install_docker
+      
+    cygwin_install_docker_machine
+
+  fi
+  
+  #recreate_files "${_files}"
+
+  recreate_files2 "${fname}" "${_tmp_install_dir}" base64fles
+
+  retval=$?
+  if [ "$retval" == "0" ]; then
+    _instfiles=( "${base64fles}" )
+    #echo -e "This files: \n${bla[@]}"
+  else
+    return 1
+  fi
+
+  cp_docker_archives_to_usr_dir "${base64fles}" "${_tmp_install_dir}"
+
+  #skip copy file in case of  ./yocto install --install-services command, only services should be installed not rewrited ...
+  #{ Copy Files
+  echo -e "\nCopying Files:"
+
+  #3)in case of standalone Windows PC installation:
+  if [ "${OS_STRING}" != "NATIVE_LINUX" ]; then
+    cp -f "${fname}" "${_tmp_install_dir}/${fname}"
+    _instfiles=( "/usr/local/bin/${fname}" ${_instfiles[@]} )
+  fi
+
+  if [ "${INSTALL_SUBSYSTEM_FILES}" == "yes" ]; then
+    #Add this script to installation files:
+    cp -f "${fname}" "${_tmp_install_dir}/${fname}"
+    _instfiles=( "/usr/local/bin/${fname}" ${_instfiles[@]} )
+  fi
+
+  
+  for fle in ${_instfiles[@]}; do
+
+    #if dest dir is same as extraction dir, we already have that files..
+    if [ "${_tmp_install_dir}" == "${fle%/*}" ]; then
+      continue
+    fi
+
+    #TODO: 2018.01.04 Skip template file(docker_user_default) copying in case :
+    #     "${INSTALL_SERVICES}" == "yes" && "${INSTALL_SUBSYSTEM_FILES}" == "no"
+    #additional things are needed:later
+    #4 installation types:
+    #1.A)Buildmachine type(admin install)        : copy/install all files and services
+    #    > ok, tested
+    #1.B)Buildmachine type(user add install)     : only copy services related files with exception of template file
+    #                                            : >copy all docker files
+    #    >ok, tested
+
+    #2)Standalone Linux PC type   : copy/install only subsystem files
+    #    >ok, tested
+
+    #3)Standalone Windows PC type : only install yocto file and nothing more
+    # >ok, no test
+
+    #Services copying
+    #the "${fle##*/}" == *"docker_user"* line also skip template file for docker_user service in case that docker_user services are not necessary....
+    if [ "${INSTALL_SERVICES}" == "no" ]; then
+      if [[ "${fle##*/}" == *"docker_user"* ]] \
+      || [ ${fle##*.} == "service" ] || [ ${fle##*.} == "socket" ] || [ ${fle##*.} == "timer" ]; then
+          continue
+      fi
+    fi
+
+    #1.B)in case of Builmachine installation and user add only: skip template file and use current one installed by admin ..
+    if [ "${INSTALL_SERVICES}" == "yes" ] && [ "${INSTALL_SUBSYSTEM_FILES}" == "no" ]; then
+      if [ "${fle##*/}" == "${DOCKER_USER_BUILMACHINE_TEMPLATE_CONFIG_FNAME}" ]; then
+          continue
+      fi
+    fi
+
+
+
+    #yocto subsystem internal tools copying [ ymount ycimg ]
+    local _tmp_skip="false"
+    if [ "${INSTALL_SUBSYSTEM_FILES}" == "no" ]; then
+      for ssfle in "${_ssfiles[@]}"; do 
+        if [ "${fle##*/}" == "${ssfle}" ]; then
+          _tmp_skip="true";break
+        fi
+      done
+      [ "${_tmp_skip}" == "true" ] && continue
+    fi
+    
+    echo -e "  ""$fle"
+
+    #check if file exist in given destination
+    if [ -f "$fle"  ]; then 
+      echo -e "  Info: "'"'$fle'"'" file already exists !!\n        Do you wanna re-write this file ?[y/n]"
+      read -p "        >" yn
+      if [ "$yn" = "y" ]||[ "$yn" = "yes" ]; then
+        ${sudo} cp -f "${_tmp_install_dir}""/""${fle##*/}" "${fle}"
+        ${sudo} chown "${USER_NAME_HOST}" "${fle}"
+        ${sudo} chmod +xr "${fle}"
+
+        if [ "${fle##*/}" == "${DOCKER_USER_BUILMACHINE_TEMPLATE_CONFIG_FNAME}" ]; then
+        #replacing settings(template) for buildmachine
+          _tmp_buildmachine_new_template="yes"
+        fi
+
+      fi
+    else
+        local _inst_dir="${fle%/*}"
+        if [ ! -e "${_inst_dir}" ]; then
+          ${sudo} mkdir -p "${_inst_dir}";
+          ${sudo} chown "${USER_NAME_HOST}" "${_inst_dir}"
+        fi
+        ${sudo} cp -f "${_tmp_install_dir}""/""${fle##*/}" "${fle}"
+        ${sudo} chown "${USER_NAME_HOST}" "${fle}"
+        ${sudo} chmod +xr "${fle}"
+
+        #
+        if [ "${fle##*/}" == "${DOCKER_USER_BUILMACHINE_TEMPLATE_CONFIG_FNAME}" ]; then
+        #first time installation in buildmachine > creating *qemurawimg for docker overlay system
+          _tmp_buildmachine_new_template="yes"
+        fi
+    fi
+  done
+  #}
+  
+  if [ "${OS_STRING}" != "NATIVE_LINUX" ]; then
+    echo -e " \n\n !! PLEASE CLOSE/TERMINATE TERMINAL AND CONTINUE IN NEW ONE !! \n\n"
+  else
+    #only in case of linux set sudoers
+    set_sudoers
+  fi
+
+
+  #{ Install Services
+  if [ "${INSTALL_SERVICES}" == "no" ]; then
+    return 0
+  fi
+  
+  echo -e "\nInstall Services:"
+  sudo systemctl daemon-reload
+  for fle in ${_instfiles[@]}; do
+    
+    #{ Systemd Services :
+    #Support for installation of normal systemd service or session-service
+    if [ ${fle##*.} == "service" ] || [ ${fle##*.} == "socket" ] || [ ${fle##*.} == "timer" ]; then 
+    
+      echo -e "  ""$fle"
+        
+      systemd_service=${fle##*/}
+      if [[ "${systemd_service}" == *"@."* ]]; then
+        #session service> session id is USER_NAME
+        session_service_full_name=${systemd_service/@./@${USER_NAME_HOST}.}
+        sudo systemctl enable "${session_service_full_name}"
+        
+        if [ ${fle##*.} == "timer" ]; then
+          sudo systemctl start "${session_service_full_name}"
+        fi
+        
+      else
+        sudo systemctl enable "${systemd_service}"
+      fi
+    fi
+    #}
+  done
+  sudo systemctl daemon-reload
+
+  if [ "${INSTALL_SERVICES}" == "yes" ]; then
+  #HERE, USER HAVE TO HAVE FULL SUDO RIGHTS, if not, it is impossible to prepare storage for docker images(chmod create dir..etc)
+
+    # _tmp_buildmachine_new_template=yes
+    # >>ask for path for docker storage, rewrite template,  create docker storage for given
+    # _tmp_buildmachine_new_template=no
+    # >>take a look to template,create path and create docker storage for given user
+
+    #check if HOME/.config/docker_user/docker exist and delete it.
+    #Now we know that we have replaced /etc/default/docker_user_default,
+    #which is template settings for all users on buildmachine.
+    #Therefore, we want to install fresh settings.
+    if [ -e "${DOCKER_USER_CONFIG_DIR}" ]; then
+      rm "${DOCKER_USER_CONFIG_DIR}"/docker 2>/dev/null
+    fi
+
+    echo -e "\nUn-mounting all images:\n"
+    /usr/local/bin/ymount unmount --unmount-all
+    echo -e "\n"
+
+    echo -e "\nBuildMachine Setup (Multi-user environment):\n"
+
+    if [ "${_tmp_buildmachine_new_template}" = "yes" ]; then
+      echo -e "  Every user in system have separated overlay storage space for docker deamon."
+      echo -e "  This storage settings is stored in template file ${DOCKER_USER_BUILMACHINE_TEMPLATE_CONFIG} "
+      echo -e "  in variable EXT_MOUNT_DOCKER_STORAGE."
+      echo -e "  For example: EXT_MOUNT_DOCKER_STORAGE=/mnt/nas/build-aufs-docker/USER_NAME/docker_imgs_storage.qemurawimg"
+      echo -e "  This settings will be copied to user's file HOME/.config/docker_user/docker  "
+      echo -e "  only once during first start of docker_user@USER.service "
+      echo -e "  Therefore, administrator will set path only once in ${DOCKER_USER_BUILMACHINE_TEMPLATE_CONFIG} ."
+      echo -e "  For example: ALL_USERS_STORAGE/USER_NAME/docker_imgs_storage.qemurawimg "
+      echo -e "               /mnt/nas/build-aufs-docker/pepa/docker_imgs_storage.qemurawimg "
+      echo -e "               /mnt/nas/build-aufs-docker/jelito/docker_imgs_storage.qemurawimg "
+      echo -e "\n"
+      echo -e "  Please enter path where all users will store docker s overlay file system(ALL_USERS_STORAGE) "
+      echo -e "  Example: /mnt/nas/build-aufs-docker/"
+      read -p "        >" -e _prefix_path
+
+      #write storage settings on the end of settings file, last var rewrite previous ....
+      echo -e "\n">>"${DOCKER_USER_BUILMACHINE_TEMPLATE_CONFIG}"
+      echo 'EXT_MOUNT_DOCKER_STORAGE=''"'${_prefix_path%/*}'/$_USER/docker_imgs_storage.qemurawimg''"'>>"${DOCKER_USER_BUILMACHINE_TEMPLATE_CONFIG}"
+      echo -e "\n"
+
+      _allpthtmp="${_prefix_path%/}""/$USER_NAME_HOST/docker_imgs_storage.qemurawimg"
+
+    else
+      _allpthtmp=$(_USER="${USER_NAME_HOST}"; . "${DOCKER_USER_BUILMACHINE_TEMPLATE_CONFIG}"; echo $EXT_MOUNT_DOCKER_STORAGE)
+    fi
+
+    echo -e "Docker storage for container images:"
+    echo -e "        >${_allpthtmp}"
+
+    #make directory if does not exist
+    if [ ! -d "${_allpthtmp%/*}" ]; then
+      mkdir -p "${_allpthtmp%/*}"
+    fi
+
+    #write access test
+    _bla="${_allpthtmp%/*}/${RANDOM}"
+    echo "writetest">"${_bla}"
+    _err_ret=$?
+    if [ "${_err_ret}" != "0" ]; then
+        echo -e "\n\nError: Unable to write to directory.Exiting "
+        exit 1
+    fi
+
+    echo -e "\nCreating storage for container images:\n"
+    echo -e "\n  Press Enter to continue"
+    read -p   "  >"
+
+    #storage already exist > skip
+    if [ -f "${_allpthtmp}" ]; then
+      echo -e "  Warning: Storage for container images already exist. "
+      echo -e "  >Skiping"
+      echo -e "\n  Press Enter to continue"
+      read -p   "  >"
+    else
+      #TODO: Problem with rights? Here full sudo user want to make image and access to img will be made from docke_user service which is running as root.
+      #No problem with access to img in above mentioned case, but in general we allow any user to create file in --img-path folder sycimg running as root>wrong
+      #/usr/local/bin/ycimg --user="$USER_NAME_HOST" --img-size-gb="${DOCKER_USER_DOCKER_IMAGES_STORAGE_SIZE_GB}" --img-path="${_allpthtmp%.*}"
+
+      /usr/local/bin/ycimg --img-size-gb="${DOCKER_USER_DOCKER_IMAGES_STORAGE_SIZE_GB}" --img-path="${_allpthtmp%.*}"
+
+      sync
+      sleep 3
+      if [ ! -f "${_allpthtmp}" ]; then
+        echo -e "\n\nError: Unable to create storage. Exiting"
+        exit 1
+      else
+        echo -e "\n\n>Ok"
+      fi
+    fi
+
+    echo -e "\nMounting storage for container images:\n"
+    echo -e "\n  Press Enter to continue"
+    read -p   "  >"
+
+    /usr/local/bin/ymount -i=0 -n -m="$_allpthtmp"
+    _ret=$?
+    [ "${_ret}" != "0" ] && exit 1
+
+    sync
+    sleep 2
+    sudo mkdir -p "/mnt/$USER_NAME_HOST/vd0/docker"
+    sync
+    sleep 2
+    if [ ! -d "/mnt/$USER_NAME_HOST/vd0/docker" ]; then
+      echo "Error: Unable to create directory in docker_imgs_storage.qemurawimg. Exiting"
+      exit 1
+    fi
+    sleep 2
+    /usr/local/bin/ymount -i=0 unmount
+    sync
+
+    echo -e "\n-----------------------------------------------"
+    echo -e "\nStarting docker_user service :\n"
+    sudo systemctl start docker_user@${USER_NAME_HOST}.service
+    _ret=$?
+    if [ "${_ret}" == "0" ]; then
+      echo -e "\n  > Ok"
+      echo -e   "  > "'Please run "yocto" command in new terminal'
+      echo -e "-----------------------------------------------\n"
+    else
+      echo -e "\n  > Error"
+      echo -e "-----------------------------------------------\n"
+      return 1;
+    fi
+
+  fi
+
+
+  #}
+  return 0;
+}
+
+
+#Create tar.bz2 image from $_yocto_base_docker_file within _yocto_base_dir
+#created tar.bz2 archive is also within _yocto_base_dir
+create_docker_image_archive_yocto_base(){
+  local _yocto_base_docker_file=$1
+  local _yocto_base_image_file=$2
+  local _yocto_base_image_name=$3
+  local _yocto_base_dir=$4
+
+  local _ret=0
+  
+  if [ ! -z "${_yocto_base_dir}" ]; then 
+    _yocto_base_dir="${_yocto_base_dir%/}/"
+  fi
+  
+  if [ ! -e "${_yocto_base_docker_file}" ]; then 
+   echo "Error:  DockerFile "'"'${_yocto_base_docker_file}'"'" does not exist "
+   return 1
+  fi
+  
+  docker_identify docker_cmd
+  _ret=$?
+  [ "${_ret}" != 0 ] && return "${_ret}"
+  
+  
+  echo -e "Create Yocto Base Image: \n"
+  
+  if [ -z "${_yocto_base_dir}" ]; then 
+    _yocto_base_dir="."
+  fi
+
+  #TODO:
+  # In case that links are used as docker files, following error appears:
+  #unable to prepare context: the Dockerfile (/home/alcz11702218/projects/yocto-tools/full/src/ubuntu1604_yocto_base.v1.docker) must be within the build context
+  #Error: Build of "/home/alcz11702218/projects/yocto-tools/full/src/ubuntu1604_yocto_base.v1.docker" dockerfile failed.
+  #TODO: Detect if $_yocto_base_docker_file" is link and inform user or quit ???
+
+  DOCKER_YOCTO_BASE_BUILD_PARAMS=" -f ${_yocto_base_docker_file} \
+                                   -t ${_yocto_base_image_name} \
+                                      ${_yocto_base_dir} "
+
+  if [ "${OS_STRING}" != "NATIVE_LINUX" ]; then
+    DOCKER_YOCTO_BASE_BUILD_PARAMS=" -f $(cygpath -aw ${_yocto_base_docker_file}) \
+                                     -t ${_yocto_base_image_name} \
+                                      $(cygpath -aw ${_yocto_base_dir}) "
+  fi
+  
+  docker_yocto_img=$("$docker_cmd" images | egrep "${_yocto_base_image_name%:*}".*"${_yocto_base_image_name#*:}")
+
+  if [ ! -z "$docker_yocto_img" ]; then
+    echo -e "  Warning: Docker image ${_yocto_base_image_name} already exists, do you want to delete this image?[y/n]"
+    read -p "         >" yn
+
+    if [ "$yn" == "y" ]; then
+      echo -e " Delete image:"
+      "$docker_cmd" rmi "${_yocto_base_image_name}"
+    fi
+  fi
+
+  echo -e "  Docker build: \n"
+  "${docker_cmd}" build ${DOCKER_YOCTO_BASE_BUILD_PARAMS}
+  _ret=$?
+  if [ "${_ret}" != 0 ]; then
+    echo "    Error: Build of "'"'${_yocto_base_docker_file}'"'" dockerfile failed."
+    return "${_ret}"
+  fi
+
+  yn="y"
+  if [ -e "${_yocto_base_image_file}" ]; then
+    echo -e "  Warning: Tar.bz2 archive ${_yocto_base_image_file} already exists, do you want to rewrite this archive?[y/n]"
+    read -p "         >" yn
+  fi
+  if [ "$yn" == "y" ]; then 
+  
+    echo -e "  Docker save: \nThis task will take some time, depends on image size:\n"
+    #_yocto_base_image_file={docker_file}.tar.bz2
+    "${docker_cmd}" save ${_yocto_base_image_name} -o "${_yocto_base_image_file%.bz2*}"
+    _ret=$?
+    if [ "${_ret}" != 0 ]; then 
+      echo -e "\n\n    Error: Docker save of "'"'${_yocto_base_image_name}'"'" image failed."
+      return "${_ret}"
+    fi
+    echo -e "\n\n"
+    
+    echo -e "  Docker image compression: \nThis task will take some time, depends on image size:\n"
+    #remove original *name.tar archive automatically
+    bzip2 -f -9 -vv "${_yocto_base_image_file/%.bz2*}"
+    _ret=$?
+    if [ "${_ret}" != 0 ]; then 
+      echo -e "\n\n    Error: Docker image compression of "'"'${_yocto_base_image_name/.bz2/}'"'" image failed."
+      return "${_ret}"
+    fi
+  fi
+
+} 
+
+
+help_desc() {
+echo -e "\
+  Usage:  yocto COMMAND OPTIONS
+                
+  COMMAND: install
+  |--OPTIONS: --install-subsystem-files, --install-services
+  |
+  |  >Only in case of install command we have to run "yocto" command in directory of executable
+  |  >Copy and set up tools/evironment in directories:
+  |   /usr/local/bin/*,
+  |   /home/USER/.config/yocto_docker/*
+  |
+  |
+  | ->In case of single-user PC(linux) please just run:
+  |    $ yocto install --install-subsystem-files
+  |
+  | ->In case of windows OS:
+  |   Yocto tool will install VirtualBox and chocolatey instalation tool.
+  |   At first install cygwin(+curl) and run terminal in priviledged mode:
+  |   $ yocto install
+  |
+  | ->In case of multi-user environment(buildmachine, linux), first time installation run:
+  |    $ yocto install --install-subsystem-files --install-services
+  |
+  | ->In case of multi-user environment(buildmachine, linux), add new user:
+  |   $ yocto install --install-services
+
+  COMMAND: cimg
+  | ->Run ycimg tool and create image for storing yocto environment
+  |   Unavailable in Windows
+
+  COMMAND: { run | '""' }
+  |--OPTIONS: --custom-docker-file| --custom-docker-file="DOCKER_FILE" | -c="DOCKER_FILE" |-c, --restart
+  |
+  | ->Run docker_user/docker with yocto-docker-container and bind
+  |   yocto image storage(docker -v) in host to container directory
+  |   (docker -v /mnt/USER/vd0/opt:/opt) run XXX
+  |
+  | ->OPTION: --custom-docker-file| --custom-docker-file="DOCKER_FILE" | -c="DOCKER_FILE" |-c
+  |   Try to run docker from docker file.
+  |   In case that option value is empty, list all docker files in DOCKER_BUILD_DIRECTORY and let user select one of them.
+  |
+  | ->OPTION: --restart
+  |   Restart virtual machine
+  |   Available only in Windows.
+
+  COMMAND: update
+  |  Check current and aviable versions and install tools.
+  |  Not implemented.
+  
+  COMMAND: { cdbimg | cdbimg="DOCKER_FILE" }
+  |  >Create docker base image. Yocto tool is composed from two docker images in order to speed up entirely process.
+  |   First docker image(docker_base_image) includes only basic environment including yocto dependencies.
+  |   This step takes a lot of time(package downloads, distro update),
+  |   because of this it can be distributed as tar.bz2 archive and during { "install" }
+  |   will be stored in user's folder /home/USER/.config/yocto_docker/*.
+  |   During yocto run and any docker_base_image in docker, yocto tool search docker_yocto_base image
+  |   in form of tar.bz2 archive in user's directory
+  |   /home/USER/.config/yocto_docker/*. As last step, in case of missing *.tar.bz2
+  |   tool makes image from distributed docker file in /home/USER/.config/yocto_docker/*.
+  |
+  |  In short, this step just create docker_base_image
+  |  located in DOCKER_FILE_DIR__AND__IMG_FILE_DIR directory or in current directory.
+  |
+  |  Name of docker file is give by YOCTO_BASE_DOCKER_FILE variable.
+
+  COMMAND: { release | release="DIRECTORY_OF_UPDATED_FILES" }
+  |--OPTIONS: {--add-base-image}
+
+"
+}
+
+
+
+cygwin_get_vboxclitool() {
+  local _ret=$1
+  
+  echo -e "Searching VirtualBox tools:"
+  
+  #cygwin in win> we will mount our yocto drive directly to docker-machine with vbox cli tool VBoxManage
+  OIFS=$IFS
+  IFS=","
+  VBOXMANAGE=( $(find /cygdrive/c/"Program Files" 2>/dev/null | grep -i VBoxManage.exe | awk '{str=$0","; print str}' ) )
+  if [ "${#VBOXMANAGE[@]}" -eq "0" ]; then
+      echo -e "\n  Error: Not able to find VBoxManage.exe in Program Files directory, please reinstall VirtualBox."
+      IFS="${OIFS}"
+      return 1
+  elif [ "${#VBOXMANAGE[@]}" -eq "1" ]; then
+      echo -e "\n  info: VBoxManage.exe found"
+      VBOXMANAGE="${VBOXMANAGE[0]}"
+      IFS="${OIFS}"
+  elif [ "${#VBOXMANAGE[@]}" -gt "1" ]; then
+      echo -e "\n  Error: Multiple VBoxManage.exe in Program Files directory, please rename/delete old ones and run it again"
+      IFS="${OIFS}"
+      return 2
+  fi
+  
+  return 0
+  #eval "${_ret}"="${VBOXMANAGE}"
+  
+}
+
+
+cygwin_vbox_create_docker_machine() {
+
+  echo -e "\nPreparing docker-machine:\n"
+  
+  #check docker machine 
+  dmachine_status=$(docker-machine status "${VBOX_DOCKER_MACHINE_NAME}" ) 
+  ret=$?
+  if [[ "${dmachine_status}" == *"Error"* ]] || [[ "${dmachine_status}" == *"error"* ]]; then
+    #in case that machine exist and VBOX virtual did not! >remove and create again ?
+    echo -e "\n\n  Error: docker-machine status error "
+    echo -e "\n         Do you want to remove docker-machine ${VBOX_DOCKER_MACHINE_NAME} ? [y/n]"
+    yn="n"
+    read -p "        >" yn
+    if [ "$yn" == "y" ]; then
+      docker-machine rm "${VBOX_DOCKER_MACHINE_NAME}"
+      sleep 1
+    else
+      exit 1
+    fi
+  fi
+
+  #machine exist ?
+  dmachine_status=$(docker-machine status "${VBOX_DOCKER_MACHINE_NAME}" ) 
+  ret=$?
+  if [ "${ret}" != "0" ]; then
+    # zero is returned only in case that machine does not exist, in case of error 0 was always returned
+    #This step take a time due to download of boot2docker.iso,
+    #so sdtout from this command should be visible to user.
+    echo -e "\n\nCreating docker-machine ${VBOX_DOCKER_MACHINE_NAME}:\n"
+    docker-machine create -d virtualbox "${VBOX_DOCKER_MACHINE_NAME}"
+    ret=$?
+    if [ "${ret}" != "0" ]; then
+      echo -e "\n  Error: Unable to create docker-machine"
+      exit 1
+    fi
+    
+  fi
+  
+  if [ "${RESTART_DOCKER_MACHINE}" == "yes" ]; then 
+    #if running->stop->start
+    #if stopped->start
+    
+    echo -e "\n\n  Restarting ${VBOX_DOCKER_MACHINE_NAME} docker-machine: \n\n"
+    
+    isstopped=$(echo ${dmachine_status} | grep -i stopped )
+    if [ -z "${isstopped}" ]; then
+      #if running->stop->start
+      
+      
+      echo -e "\n\n  Docker machine is running: Stop\n\n"
+      #stop
+      docker-machine stop "${VBOX_DOCKER_MACHINE_NAME}"
+      ret=$?
+      if [ "${ret}" != "0" ]; then
+        echo -e "\n    Error: Unable to stop docker-machine"
+        exit 1
+      fi
+      
+    fi
+    #if stopped->start
+    
+    echo -e "\n\n  Docker machine is stopped: Start\n\n"
+    #start
+    docker-machine start "${VBOX_DOCKER_MACHINE_NAME}"
+    ret=$?
+    if [ "${ret}" != "0" ]; then
+      echo -e "\n    Error: Unable to start docker-machine"
+      exit 1
+    fi
+    
+  
+  fi
+  #in order to add new drive to setting vbox have to be stopped
+  #isstopped=$(echo ${dmachine_status} | grep -i stopped )
+
+  #if [ -z "${isstopped}" ]; then
+  #  bla=$(docker-machine stop "${VBOX_DOCKER_MACHINE_NAME}")
+  #  ret=$?
+  #  if [ "${ret}" != "0" ]; then
+  #    echo -e "\n  Error: Unable to stop docker-machine"
+  #    exit 1
+  #  fi
+  #fi
+
+}
+
+
+os_detect() {
+
+  local _ret=$1
+  local _ret2=$2
+
+  local _IS64BIT="n"
+  
+  iscygwin=$(uname | grep -i cygwin)  
+  
+  [[ "$(uname -m)" == *"64"* ]] && _IS64BIT="y"
+  
+  if [ ! -z ${iscygwin} ]; then
+    eval "${_ret}"="CYGWIN"
+  else
+    eval "${_ret}"="NATIVE_LINUX"
+    
+    testedenv=$(lsb_release -i | egrep -i "ubuntu|fedora") 
+    if [ -z "${testedenv}" ]; then
+      echo -e "\n\n--\n  Warning: This distribution have not been tested !\n--\n\n"
+    fi
+  fi
+  
+  eval "${_ret2}"="${_IS64BIT}"
+  
+}
+
+
+main() {
+
+  echo -e "\n"
+  os_detect OS_STRING IS64BIT
+  
+  sudo=""
+  if [ "${OS_STRING}" == "NATIVE_LINUX" ]; then
+    sudo="sudo"
+    export sudo
+  fi
+  
+  
+  VERSION="0.1"
+  
+  fname=$(basename $0)
+  release_fname="../release/${fname}"
+  
+  operation="run"
+  
+  ADD_BASE_IMAGE="no"
+  INSTALL_SUBSYSTEM_FILES="no"
+  INSTALL_SERVICES="no"
+  RESTART_DOCKER_MACHINE="no"
+
+  DOCKER_USER_DOCKER_IMAGES_STORAGE_SIZE_GB="10"
+
+  #Because of -n parameter ymount will not do secont mount to /opt/$USER/works,
+  #because of that also did not check if we have empty, fresh image from ycimg
+  #But, it allow as test image owner and opt paths
+  YOCTO_IMAGE_MOUNT_COMMAND_NO_OPT="ymount -i=0 -n"
+  YOCTO_IMAGE_MOUNT_COMMAND="ymount -i=0"
+  
+  #{
+  USER_NAME_HOST=$(id -un $USER)
+  USER_UID_HOST=$(id -u $USER)
+  USER_GID_HOST=$(id -g $USER)
+
+  YOCTO_DOCKER_CONFIG_DIR="/home/$USER_NAME_HOST/.config/yocto_docker"
+  DOCKER_USER_CONFIG_DIR="/home/$USER_NAME_HOST/.config/docker_user"
+
+  TEMP_INSTALLATION_DIRECTORY="${YOCTO_DOCKER_CONFIG_DIR}/tmp_yocto_inst_${VERSION}"
+  DOCKER_BUILD_DIRECTORY="${YOCTO_DOCKER_CONFIG_DIR}/build_${VERSION}"
+
+#{paths in base64 files, used during update command
+  BASE64_DATA_YOCTO_DOCKER_CONFIG_DIR="/home/\$USER_NAME_HOST/.config/yocto_docker"
+  BASE64_DATA_DOCKER_USER_CONFIG_DIR="/home/\$USER_NAME_HOST/.config/docker_user"
+
+  BASE64_DATA_TEMP_INSTALLATION_DIRECTORY="${BASE64_DATA_YOCTO_DOCKER_CONFIG_DIR}/tmp_yocto_inst_${VERSION}"
+  BASE64_DATA_DOCKER_BUILD_DIRECTORY="${BASE64_DATA_YOCTO_DOCKER_CONFIG_DIR}/build_${VERSION}"
+#}
+
+  DOCKER_USER_BUILMACHINE_TEMPLATE_CONFIG_FNAME="docker_user_default"
+  DOCKER_USER_BUILMACHINE_TEMPLATE_CONFIG="/etc/default/${DOCKER_USER_BUILMACHINE_TEMPLATE_CONFIG_FNAME}"
+  YOCTO_USER_DOCKER_FILE=""
+  #}
+
+  #YOCTO_BASE_DOCKER_FILES
+  #YOCTO_BASE_DOCKER_FILES1="${DOCKER_BUILD_DIRECTORY}/ubuntu14045_yocto_base.v4.docker"
+  #YOCTO_BASE_DOCKER_FILES2="${DOCKER_BUILD_DIRECTORY}/ubuntu1604_yocto_base.v1.docker"
+
+  #get_base_image_archive_path "${TEMP_INSTALLATION_DIRECTORY}" "${YOCTO_BASE_DOCKER_FILE}" YOCTO_BASE_IMAGE_FILE
+  #YOCTO_USER_DOCKER_FILE="${DOCKER_BUILD_DIRECTORY}/ubuntu14045_yocto_user.v2.docker"
+
+  ##DOCKER_YOCTO_BASE_IMG_NAME
+
+  #{ 
+  #get_image_name "${YOCTO_BASE_DOCKER_FILE}" "gandrys" DOCKER_YOCTO_BASE_IMG_NAME
+  #}
+
+  # { INSTALATIONFILES:
+  
+  #builmachine user install: all with exception ycimg, ymount, yocto, docker_user_default
+    #> ok default install >INSTALL_SERVICES="no", install_subsystem_files="no"
+  
+  #non-builmachine pc fresh install:
+    #>all with exception of INSTALL_SERVICES="no"
+  
+  #builmachine admin install: 
+    #>INSTALL_SERVICES="no", install_subsystem_files="yes"
+
+  SUBSYSTEM_FILES="ycimg sycimg ymount symount"
+  YOCTO_TOOLS__RELEASE_FILES_BASE="/usr/local/bin/ycimg /usr/local/bin/sycimg \
+                                    /usr/local/bin/ymount /usr/local/bin/symount\
+                                    /usr/local/bin/umess.sh \
+                                    ${DOCKER_USER_BUILMACHINE_TEMPLATE_CONFIG} \
+                                    /lib/systemd/system/docker_user_prep.sh \
+                                    /lib/systemd/system/docker_user_prep@.service \
+                                    /lib/systemd/system/docker_user@.socket \
+                                    /lib/systemd/system/docker_user@.service \
+                                    /lib/systemd/system/mounts_disconects@.service \
+                                    /lib/systemd/system/mounts_disconects@.timer"
+
+  # }
+
+  #Cases where docker related files are in different places are following:
+  #1)install : extract from file itself in base64      : + read names and add decode base64 and return file list;
+  # done>tested on ubuntu 16.04
+
+  #2)release : files are in src folder(skip this file) : + add fls to this file in base64 + add names;
+  # done>tested on ubuntu 16.04
+  #>YOCTO_TOOLS__RELEASE_FILES_BASE + search docker files and archives in src folder
+
+  #3)cdbimg : Create docker base image:
+  # done>tested on ubuntu 16.04
+  #Selectable by user
+
+  #4)run     : only necessary files are docker file and the they are in DOCKER_BUILD_DIRECTORY      :
+  #TODO:!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!2017.12.21
+
+  #--custom-img(choosing user_image),(without this input parameter always gives user choice from docker_build_dir)
+  # cdbimg(create base image )(choosing base image)
+  # and run(choosing user_image)(+add dependency functions )
+
+
+
+  ##YOCTO_BASE_DOCKER_FILE: egrep yocto_base.*v.*\.docker
+  ##YOCTO_USER_DOCKER_FILE: egrep yocto_user.*v.*\.docker
+  ##YOCTO_BASE_IMAGE_FILE:  egrep yocto_base.*v.*docker\..*tar\.bz2
+
+  
+  for arg in "$@"; do
+    
+    case "$arg" in 
+      help|--help|-h|\?)
+        help_desc
+        exit 0;
+      ;;
+      
+      install)
+        operation="install"
+      ;;
+      
+      cimg)
+      
+        if [ "${OS_STRING}" != "NATIVE_LINUX" ]; then
+          echo -e "\n  This command/option is not available in windows systems,\n please create image in Linux"
+          exit 1
+        fi
+        
+        operation="create_yocto_image_storage"
+      ;;
+      
+      run)
+        operation="run"
+        prep_yocto_user_docker_file=""
+      ;;
+      
+      cdbimg|cdbimg=*)
+        operation="prep_docker_create_base_image"
+        prep_yocto_base_docker_file=""
+        if [ ! "$arg" == "cdbimg" ]; then
+          prep_yocto_base_docker_file="${arg#*=}"
+        fi
+      ;;
+      
+      release|release=*)
+        operation="prep_script_update"
+        fls_dir=""
+        if [ ! "$arg" == "release" ]; then
+          fls_dir="${arg#*=}"
+        fi
+      ;;
+      
+      --add-base-image)
+        ADD_BASE_IMAGE="yes"
+      ;;
+      
+      --install-subsystem-files)
+        if [ "${OS_STRING}" != "NATIVE_LINUX" ]; then
+          echo -e "\n  This command/option is not available in windows systems,\n please create image in Linux"
+          exit 1
+        fi
+        INSTALL_SUBSYSTEM_FILES="yes"
+      ;;
+      
+      --install-services)
+        INSTALL_SERVICES="yes"
+      ;;
+      
+      --restart)
+        RESTART_DOCKER_MACHINE="yes"
+      ;;
+      
+      --custom-img|--custom-img=*|-c=*|-c)
+
+        if [ ! "$arg" == "--custom-img" ] && [ ! "$arg" == "-c" ]; then
+        #user selected docker_user file by parameter>
+          prep_yocto_user_docker_file="${arg#*=}"
+        fi
+
+      ;;
+      
+    esac
+  done
+
+  ##here we know what user wants
+  #==========================================================================================
+  if [ "$operation" != "install" ]; then
+  
+    DEPENDENCIES_LIST=( "grep --help 0" "egrep --help 0" "awk --help 0" "mkdir --help 0" "chmod --help 0" \
+                      "chown --help 0" "losetup --help 0" "kpartx --help 1" "mount --help 0" "id --help 0" \
+                      "smbstatus --help 1" "smbcontrol --help 1" "docker -v 0" "base64 --version 0" \
+                      "git --version 0" "bunzip2 --help 0" "qemu-img --help 0" "mkfs.ext4 -V 0" "fdisk --help 0")
+
+    if [ "${OS_STRING}" != "NATIVE_LINUX" ]; then
+  
+      VBOX_DOCKER_MACHINE_NAME="yocto-docker"
+      DEPENDENCIES_LIST+=( "docker-machine -v 0" )  
+      VBOX_YOCTO_VOLUME_NAME="yoctomnt"
+    
+      cygwin_get_vboxclitool 
+      ret=$?
+      [ "${ret}" != "0" ] && exit 1
+
+    fi
+  
+    dependencies_test
+    ret=$?
+    [ "${ret}" != "0" ] && exit 1
+    #========================================================================================== 
+
+    if [ "${OS_STRING}" != "NATIVE_LINUX" ]; then
+      cygwin_vbox_create_docker_machine
+    fi
+  
+    ##try2update
+  fi
+  #========================================================================================== 
+  
+  if [ "$operation" == "install" ]; then
+  
+    install_files "${YOCTO_DOCKER_USER__FILES_CHECK_LIST}" "${SUBSYSTEM_FILES}" "${TEMP_INSTALLATION_DIRECTORY}"
+
+  elif [ "$operation" == "create_yocto_image_storage" ]; then  
+    
+    DEPENDENCIES_LIST+=( "ycimg ? 0" )
+    dependencies_test
+    ret=$?
+    [ "${ret}" != "0" ] && exit 1
+  
+    ycimg
+    
+    
+  elif [ "$operation" == "run" ]; then  
+  
+    DEPENDENCIES_LIST+=( "ymount ? 0" )
+    dependencies_test
+    ret=$?
+    [ "${ret}" != "0" ] && exit 1
+
+    #TODO: here !!
+    #""
+    if [ -z "${prep_yocto_user_docker_file}"  ]; then
+      #find docker files build directory and propt user to select one
+      select_file "*_yocto_user*.v*.docker" "${DOCKER_BUILD_DIRECTORY}" YOCTO_USER_DOCKER_FILE
+      yocto_user_prep_dir="${YOCTO_USER_DOCKER_FILE%/*}"
+    else
+
+      bla_arr=( ${prep_yocto_user_docker_file////" "} );
+      if [ ${#bla_arr[@]} -eq 2 ] && [ ${bla_arr[0]} == "." ];then
+        #"./XXX " > in local fldr
+        yocto_user_prep_dir="$(pwd)"
+        YOCTO_USER_DOCKER_FILE="${yocto_user_prep_dir}/${bla_arr[1]}"
+      elif [ ${#bla_arr[@]} -eq 1 ] && [ ${bla_arr[0]} == "${prep_yocto_user_docker_file}" ]; then
+        #"XXX" with no slash > search in build dir or in local dir ..priority have local dir
+        if [ -e "${prep_yocto_user_docker_file}" ]; then
+          #if user did fill only name > at first search in current directory
+          #>first find in current folder
+            #./test.docker, #test.docker
+            #user enter only file name without path -> if current directory includes this file -> load
+          yocto_user_prep_dir="$(pwd)"
+          YOCTO_USER_DOCKER_FILE="${yocto_user_prep_dir}/${prep_yocto_user_docker_file}"
+        elif [ -e "${DOCKER_BUILD_DIRECTORY}/${prep_yocto_user_docker_file}" ]; then
+          #user enter only file name without path -> if build dir includes this file -> load
+          yocto_user_prep_dir="${DOCKER_BUILD_DIRECTORY}"
+          YOCTO_USER_DOCKER_FILE="${yocto_user_prep_dir}/${prep_yocto_user_docker_file}"
+        fi
+      else
+         #./sdfdsfd/XXX and more deeper
+         yocto_user_prep_dir="${prep_yocto_user_docker_file%/*}"
+         YOCTO_USER_DOCKER_FILE="${prep_yocto_user_docker_file}"
+      fi
+
+    fi
+
+    #only YOCTO_USER_DOCKER_FILE variable user can change from cmd line, so check if exist ..
+    if [ ! -e "${YOCTO_USER_DOCKER_FILE}" ]; then
+      echo -e "\n  Error: Docker file does not exists: "'"'${YOCTO_USER_DOCKER_FILE}'"'
+      exit 1
+    fi
+
+    yocto_run "${YOCTO_USER_DOCKER_FILE}" "${yocto_user_prep_dir}" "${TEMP_INSTALLATION_DIRECTORY}"
+    ret=$?
+    [ "${ret}" != "0" ] && exit 1
+    
+  elif [ "$operation" == "prep_docker_create_base_image" ]; then
+
+        if [ -z "${prep_yocto_base_docker_file}" ]; then
+          #if user did not fill path > let him choose from "${DOCKER_BUILD_DIRECTORY}"
+          #find docker files build directory and prompt user to select one
+          select_file "*yocto_base.v*.docker" "${DOCKER_BUILD_DIRECTORY}" YOCTO_BASE_DOCKER_FILE
+          yocto_base_prep_dir="${DOCKER_BUILD_DIRECTORY}"
+        else
+          bla_arr=( ${prep_yocto_base_docker_file////" "} );
+          if [ ${#bla_arr[@]} -eq 2 ] && [ ${bla_arr[0]} == "." ];then
+            #"./XXX test" > in local fldr
+            yocto_base_prep_dir="$(pwd)"
+          elif [ ${#bla_arr[@]} -eq 1 ] && [ ${bla_arr[0]} == "${prep_yocto_base_docker_file}" ]; then
+            #"XXX" with no slash > search in build dir or in local dir ..priority have local dir
+            if [ -e "${prep_yocto_base_docker_file}" ]; then
+              #if user did fill only name > at first search in current directory
+              #>first find in current folder
+                #./test.docker
+                #test.docker
+                #user enter only file name without path -> if current directory includes this file -> load
+              yocto_base_prep_dir="$(pwd)"
+              YOCTO_BASE_DOCKER_FILE="${yocto_base_prep_dir}/${prep_yocto_base_docker_file}"
+            elif [ -e "${DOCKER_BUILD_DIRECTORY}/${prep_yocto_base_docker_file}" ]; then
+              #user enter only file name without path -> if build dir includes this file -> load
+              yocto_base_prep_dir="${DOCKER_BUILD_DIRECTORY}"
+              YOCTO_BASE_DOCKER_FILE="${yocto_base_prep_dir}/${prep_yocto_base_docker_file}"
+            fi
+
+          else
+             yocto_base_prep_dir="${prep_yocto_base_docker_file%/*}"
+             YOCTO_BASE_DOCKER_FILE="${prep_yocto_base_docker_file}"
+          fi
+
+        fi
+
+    get_image_name "${YOCTO_BASE_DOCKER_FILE}" "gandrys" DOCKER_YOCTO_BASE_IMG_NAME
+    get_base_image_archive_path "${TEMP_INSTALLATION_DIRECTORY}" "${YOCTO_BASE_DOCKER_FILE}" _yocto_base_image_file
+
+    create_docker_image_archive_yocto_base "${YOCTO_BASE_DOCKER_FILE}" "${_yocto_base_image_file}" "${DOCKER_YOCTO_BASE_IMG_NAME}" "${yocto_base_prep_dir}"
+    
+  elif [ "$operation" == "prep_script_update" ]; then
+  
+    update_script_data2 "${YOCTO_TOOLS__RELEASE_FILES_BASE}" "${fls_dir}" "${BASE64_DATA_DOCKER_BUILD_DIRECTORY}" "${BASE64_DATA_TEMP_INSTALLATION_DIRECTORY}"
+
+  fi
+  
+  echo -e "\n"
+  exit 1
+}
+
+main "$@"
+exit 222
+
+BASE64_DATA_FILES:
