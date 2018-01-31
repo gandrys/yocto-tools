@@ -12,10 +12,10 @@
 FROM gandrys/ubuntu1604_yocto_base:v1
 MAINTAINER Andrys Jiri "andrys.jiri+project_yocto_docker@gmail.com"
 
-LABEL Name="ubuntu1604_yocto_user.v1.docker" \
+LABEL Name="ubuntu1604_yocto_user.v2.docker" \
       Author="Andrys Jiri" \
-      Date="2017.12.21" \
-      Version="0.1" \
+      Date="2018.01.31" \
+      Version="0.2" \
       Description="Yocto docker file"
 
 
@@ -53,6 +53,8 @@ RUN echo "PATH=\$PATH:/home/${USER_NAME}/bin" >>"/home/${USER_NAME}/.bashrc"
 #}
 
 RUN ln -s /opt/${USER_NAME}/works/.bash_history /home/${USER_NAME}/.bash_history
+RUN ln -s /opt/${USER_NAME}/works/.gitconfig /home/${USER_NAME}/.gitconfig
+
 
 ENV LC_ALL en_GB.UTF-8
 ENV LANG en_GB.UTF-8

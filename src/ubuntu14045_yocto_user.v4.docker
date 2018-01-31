@@ -12,11 +12,11 @@
 FROM gandrys/ubuntu14045_yocto_base:v5
 MAINTAINER Andrys Jiri "andrys.jiri+project_yocto_docker@gmail.com"
 
-LABEL Name="ubuntu14045_yocto_user.v3.docker" \
+LABEL Name="ubuntu14045_yocto_user.v4.docker" \
       Author="Andrys Jiri" \
-      Date="2017.12.21" \
-      Version="0.3" \
-      Description="Yocto docker file"
+      Date="2018.01.31" \
+      Version="0.4" \
+      Description="Yocto-user docker file"
 
 
 #{ Variables: docker build --build-arg <varname>=<value> 
@@ -53,6 +53,7 @@ RUN echo "PATH=\$PATH:/home/${USER_NAME}/bin" >>"/home/${USER_NAME}/.bashrc"
 #}
 
 RUN ln -s /opt/${USER_NAME}/works/.bash_history /home/${USER_NAME}/.bash_history
+RUN ln -s /opt/${USER_NAME}/works/.gitconfig /home/${USER_NAME}/.gitconfig
 
 ENV LC_ALL en_GB.UTF-8
 ENV LANG en_GB.UTF-8

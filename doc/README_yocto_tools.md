@@ -1,5 +1,5 @@
 
-# *yocto-tools [Andrys Jiri, 2018.01.25]*  
+# *yocto-tools [Andrys Jiri, 2018.01.31]*  
 
  Author        : Jiri Andrys  
  Maintainer    : Jiri Andrys  
@@ -80,8 +80,8 @@ Yocto-tools has been tested on following systems:
  * Ubuntu 14.04(64bit)
  * Ubuntu 16.04(64bit with docker) 
  * Fedora 24(64bit)  
- * Windows 7(32bit)
- * Windows 7(64bit)
+ * Windows 7(32bit)[bug in this release]
+ * Windows 7(64bit)[bug in this release]
   
 
 ## 2. Getting Started 
