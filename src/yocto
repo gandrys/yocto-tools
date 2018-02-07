@@ -2,8 +2,8 @@
 #====================================================================
 # NAME      :   yocto
 # AUTHOR    :   Andrys Jiri
-# DATE      :   2018.01.08
-# VERSION   :   0.66
+# DATE      :   2018.02.06
+# VERSION   :   0.67
 #
 # DEPENDENCIES :
 #               Binaries: bash, grep, egrep, awk, mkdir, chmod, chown, 
@@ -679,7 +679,7 @@ yocto_run() {
 
         if [ "${ret}" == "0" ]; then 
           #remove tar archive after proper load
-          rm "${YOCTO_BASE_IMAGE_FILE%.bz2*}"
+          rm -f "${YOCTO_BASE_IMAGE_FILE%.bz2*}"
         fi 
         
         echo -e "\n\n"
@@ -1204,18 +1204,6 @@ set_sudoers() {
     exit
   fi
 
-  #check if general /etc/sudoers includes sycimg symount commands if not > add
-  subsystfiles_in_sudoers=$(sudo bash -c "cat "${sudoerr_file}" | egrep yocto-tools.*sycimg.*symount")
-  if [ -z "${subsystfiles_in_sudoers}" ]; then
-     sudo bash -c "echo -e \%yocto-tools   ALL\=NOPASSWD:  /usr/local/bin/sycimg, /usr/local/bin/symount >>"${sudoerr_file}" "
-  fi
-
-
-
-  if [ "${INSTALL_SERVICES}" != "yes" ]; then
-    return 0;
-  fi
-
   #check if #includedir /etc/sudoers.d exist if not add and create directory
   includedir_in_sudoers=$(sudo bash -c "cat "${sudoerr_file}" | egrep '\#includedir'.*'/etc/sudoers.d'")
   if [ -z "${includedir_in_sudoers}" ]; then
@@ -1226,14 +1214,30 @@ set_sudoers() {
   #add services related commands
   if [ -f "${sudoerr_inclusrfile}" ]; then
     echo -e "\nWarning: Sudoerrs file for given user already exist and will be erased"
-    sudo rm "${sudoerr_inclusrfile}"
+    sudo rm -f "${sudoerr_inclusrfile}"
   fi
 
-  sudo bash -c "echo -e  "${USER_NAME_HOST}"  ALL\=NOPASSWD:  /bin/systemctl start docker_user@"${USER_NAME_HOST}".service >>${sudoerr_inclusrfile}"
-  sudo bash -c "echo -e  "${USER_NAME_HOST}"  ALL\=NOPASSWD:  /bin/systemctl stop  docker_user@"${USER_NAME_HOST}".service >>${sudoerr_inclusrfile}"
-  sudo bash -c "echo -e  "${USER_NAME_HOST}"  ALL\=NOPASSWD:  /bin/systemctl stop  mounts_disconects@"${USER_NAME_HOST}".timer >>${sudoerr_inclusrfile}"
-  sudo bash -c "echo -e  "${USER_NAME_HOST}"  ALL\=NOPASSWD:  /bin/systemctl start mounts_disconects@"${USER_NAME_HOST}".timer >>${sudoerr_inclusrfile}"
 
+  #In case of acl groups sudo wants always password,
+  #but if we add users to sudoerr file user will not be propted for password
+
+  #In case of normal install
+  sudo bash -c "echo -e  "${USER_NAME_HOST}"  ALL\=NOPASSWD:  /usr/local/bin/sycimg, /usr/local/bin/symount >>${sudoerr_inclusrfile}"
+
+  #In case of buildmachine install
+  if [ "${INSTALL_SERVICES}" == "yes" ]; then
+    sudo bash -c "echo -e  "${USER_NAME_HOST}"  ALL\=NOPASSWD:  /bin/systemctl start docker_user@"${USER_NAME_HOST}".service >>${sudoerr_inclusrfile}"
+    sudo bash -c "echo -e  "${USER_NAME_HOST}"  ALL\=NOPASSWD:  /bin/systemctl stop  docker_user@"${USER_NAME_HOST}".service >>${sudoerr_inclusrfile}"
+    
+    sudo bash -c "echo -e  "${USER_NAME_HOST}"  ALL\=NOPASSWD:  /bin/systemctl start mounts_disconects@"${USER_NAME_HOST}".timer >>${sudoerr_inclusrfile}"    
+    sudo bash -c "echo -e  "${USER_NAME_HOST}"  ALL\=NOPASSWD:  /bin/systemctl stop  mounts_disconects@"${USER_NAME_HOST}".timer >>${sudoerr_inclusrfile}"
+    
+    sudo bash -c "echo -e  "${USER_NAME_HOST}"  ALL\=NOPASSWD:  /bin/systemctl disable  mounts_disconects@"${USER_NAME_HOST}".timer >>${sudoerr_inclusrfile}"
+    sudo bash -c "echo -e  "${USER_NAME_HOST}"  ALL\=NOPASSWD:  /bin/systemctl enable  mounts_disconects@"${USER_NAME_HOST}".timer >>${sudoerr_inclusrfile}"
+    
+    sudo bash -c "echo -e  "${USER_NAME_HOST}"  ALL\=NOPASSWD:  /bin/systemctl start mounts_disconects@"${USER_NAME_HOST}".service >>${sudoerr_inclusrfile}"
+    sudo bash -c "echo -e  "${USER_NAME_HOST}"  ALL\=NOPASSWD:  /bin/systemctl stop  mounts_disconects@"${USER_NAME_HOST}".service >>${sudoerr_inclusrfile}"
+  fi
 }
 
 install_files() {
@@ -1370,8 +1374,42 @@ install_files() {
       read -p "        >" yn
       if [ "$yn" = "y" ]||[ "$yn" = "yes" ]; then
         ${sudo} cp -f "${_tmp_install_dir}""/""${fle##*/}" "${fle}"
-        ${sudo} chown "${USER_NAME_HOST}" "${fle}"
-        ${sudo} chmod +xr "${fle}"
+        #${sudo} chown "${USER_NAME_HOST}" "${fle}"
+        #${sudo} chmod +xr "${fle}"
+
+        #ACL-rights for subsystem files and "yocto"
+        _ssfilesplusyocto=( "${fname}" ${_ssfiles[@]} )
+        for ssfle in "${_ssfilesplusyocto[@]}"; do
+          if [ "${fle##*/}" == "${ssfle}" ]; then
+            ${sudo} chown "${SUBSYSTEM_FILES_ACL_CHOWN}" "${fle}"
+            ${sudo} chmod "${SUBSYSTEM_FILES_ACL_CHMOD}" "${fle}"
+          fi
+        done
+
+        #ACL-rights for services
+        if [ ${fle##*.} == "service" ] || [ ${fle##*.} == "socket" ] || [ ${fle##*.} == "timer" ]; then
+          ${sudo} chown "${SERVICE_FILES_ACL_CHOWN}" "${fle}"
+          ${sudo} chmod "${SERVICE_FILES_ACL_CHMOD}" "${fle}"
+        fi
+
+        #ACL-rights for *.sh files
+        if [ ${fle##*.} == "sh" ]; then
+          ${sudo} chown "${OTHER_SH_ACL_CHOWN}" "${fle}"
+          ${sudo} chmod "${OTHER_SH_ACL_CHMOD}" "${fle}"
+        fi
+
+        #ACL-rights for *.docker files
+        if [ ${fle##*.} == "docker" ]; then
+          ${sudo} chown "${DOCKER_FILES_ACL_CHOWN}" "${fle}"
+          ${sudo} chmod "${DOCKER_FILES_ACL_CHMOD}" "${fle}"
+        fi
+
+        #ACL-rights for template file
+        if [ "${fle##*/}" == "${DOCKER_USER_BUILMACHINE_TEMPLATE_CONFIG_FNAME}" ]; then
+          ${sudo} chown "${TEMPLATE_FILE_ACL_CHOWN}" "${fle}"
+          ${sudo} chmod "${TEMPLATE_FILE_ACL_CHMOD}" "${fle}"
+        fi
+
 
         if [ "${fle##*/}" == "${DOCKER_USER_BUILMACHINE_TEMPLATE_CONFIG_FNAME}" ]; then
         #replacing settings(template) for buildmachine
@@ -1381,13 +1419,47 @@ install_files() {
       fi
     else
         local _inst_dir="${fle%/*}"
+
         if [ ! -e "${_inst_dir}" ]; then
           ${sudo} mkdir -p "${_inst_dir}";
           ${sudo} chown "${USER_NAME_HOST}" "${_inst_dir}"
         fi
         ${sudo} cp -f "${_tmp_install_dir}""/""${fle##*/}" "${fle}"
-        ${sudo} chown "${USER_NAME_HOST}" "${fle}"
-        ${sudo} chmod +xr "${fle}"
+        #${sudo} chown "${USER_NAME_HOST}" "${fle}"
+        #${sudo} chmod +xr "${fle}"
+
+        #ACL-rights for subsystem files and "yocto"
+        _ssfilesplusyocto=( "${fname}" ${_ssfiles[@]}  )
+        for ssfle in "${_ssfilesplusyocto[@]}"; do
+          if [ "${fle##*/}" == "${ssfle}" ]; then
+            ${sudo} chown "${SUBSYSTEM_FILES_ACL_CHOWN}" "${fle}"
+            ${sudo} chmod "${SUBSYSTEM_FILES_ACL_CHMOD}" "${fle}"
+          fi
+        done
+
+        #ACL-rights for services
+        if [ ${fle##*.} == "service" ] || [ ${fle##*.} == "socket" ] || [ ${fle##*.} == "timer" ]; then
+          ${sudo} chown "${SERVICE_FILES_ACL_CHOWN}" "${fle}"
+          ${sudo} chmod "${SERVICE_FILES_ACL_CHMOD}" "${fle}"
+        fi
+
+        #ACL-rights for *.sh files
+        if [ ${fle##*.} == "sh" ]; then
+          ${sudo} chown "${OTHER_SH_ACL_CHOWN}" "${fle}"
+          ${sudo} chmod "${OTHER_SH_ACL_CHMOD}" "${fle}"
+        fi
+
+        #ACL-rights for *.docker files
+        if [ ${fle##*.} == "docker" ]; then
+          ${sudo} chown "${DOCKER_FILES_ACL_CHOWN}" "${fle}"
+          ${sudo} chmod "${DOCKER_FILES_ACL_CHMOD}" "${fle}"
+        fi
+
+        #ACL-rights for template file
+        if [ "${fle##*/}" == "${DOCKER_USER_BUILMACHINE_TEMPLATE_CONFIG_FNAME}" ]; then
+          ${sudo} chown "${TEMPLATE_FILE_ACL_CHOWN}" "${fle}"
+          ${sudo} chmod "${TEMPLATE_FILE_ACL_CHMOD}" "${fle}"
+        fi
 
         #
         if [ "${fle##*/}" == "${DOCKER_USER_BUILMACHINE_TEMPLATE_CONFIG_FNAME}" ]; then
@@ -1455,6 +1527,10 @@ install_files() {
       rm "${DOCKER_USER_CONFIG_DIR}"/docker 2>/dev/null
     fi
 
+    echo -e "\nStopping docker_user service:\n"
+    ${sudo} systemctl stop docker_user@${USER_NAME_HOST}.service
+    sleep 5
+
     echo -e "\nUn-mounting all images:\n"
     /usr/local/bin/ymount unmount --unmount-all
     echo -e "\n"
@@ -1477,15 +1553,20 @@ install_files() {
       echo -e "  Example: /mnt/nas/build-aufs-docker/"
       read -p "        >" -e _prefix_path
 
-      #write storage settings on the end of settings file, last var rewrite previous ....
-      echo -e "\n">>"${DOCKER_USER_BUILMACHINE_TEMPLATE_CONFIG}"
-      echo 'EXT_MOUNT_DOCKER_STORAGE=''"'${_prefix_path%/*}'/$_USER/docker_imgs_storage.qemurawimg''"'>>"${DOCKER_USER_BUILMACHINE_TEMPLATE_CONFIG}"
+      #echo -e "\n">>"${DOCKER_USER_BUILMACHINE_TEMPLATE_CONFIG}"
+      #echo 'EXT_MOUNT_DOCKER_STORAGE=''"'${_prefix_path%/*}'/$_USER/docker_imgs_storage.qemurawimg''"'>>"${DOCKER_USER_BUILMACHINE_TEMPLATE_CONFIG}"
+
+      ${sudo} sed -i 's@.*EXT_MOUNT_DOCKER_STORAGE=.*@EXT_MOUNT_DOCKER_STORAGE='"${_prefix_path%/*}"'/$_USER/docker_imgs_storage.qemurawimg@' "${DOCKER_USER_BUILMACHINE_TEMPLATE_CONFIG}"
+
       echo -e "\n"
 
       _allpthtmp="${_prefix_path%/}""/$USER_NAME_HOST/docker_imgs_storage.qemurawimg"
 
     else
-      _allpthtmp=$(_USER="${USER_NAME_HOST}"; . "${DOCKER_USER_BUILMACHINE_TEMPLATE_CONFIG}"; echo $EXT_MOUNT_DOCKER_STORAGE)
+      #we dont want to run this script, only extract variables...
+      _allpthtm1=$( ${sudo} awk '{varname="EXT_MOUNT_DOCKER_STORAGE=";if(index($0,varname)){bla=$0;sub(varname,"",bla);gsub("\"","",bla);print bla }    }' "${DOCKER_USER_BUILMACHINE_TEMPLATE_CONFIG}" )
+      #eval..
+      _allpthtmp=$(_USER="${USER_NAME_HOST}"; eval echo "${_allpthtm1}" )
     fi
 
     echo -e "Docker storage for container images:"
@@ -1969,6 +2050,25 @@ main() {
     #>INSTALL_SERVICES="no", install_subsystem_files="yes"
 
   SUBSYSTEM_FILES="ycimg sycimg ymount symount"
+  #subsystem files includes this file
+  SUBSYSTEM_FILES_ACL_CHMOD="750"
+  SUBSYSTEM_FILES_ACL_CHOWN="root:yocto-tools"
+
+  #-rwr--r--
+  SERVICE_FILES_ACL_CHMOD="644"
+  SERVICE_FILES_ACL_CHOWN="root:root"
+
+  OTHER_SH_ACL_CHMOD="750"
+  OTHER_SH_ACL_CHOWN="root:root"
+
+  DOCKER_FILES_ACL_CHMOD="750"
+  DOCKER_FILES_ACL_CHOWN="${USER_NAME_HOST}:${USER_NAME_HOST}"
+
+  #during only services installation user will read
+  TEMPLATE_FILE_ACL_CHMOD="660"
+  TEMPLATE_FILE_ACL_CHOWN="root:root"
+  #TEMPLATE_CONFIG_FNAME
+
   YOCTO_TOOLS__RELEASE_FILES_BASE="/usr/local/bin/ycimg /usr/local/bin/sycimg \
                                     /usr/local/bin/ymount /usr/local/bin/symount\
                                     /usr/local/bin/umess.sh \

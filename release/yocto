@@ -2,8 +2,8 @@
 #====================================================================
 # NAME      :   yocto
 # AUTHOR    :   Andrys Jiri
-# DATE      :   2018.01.08
-# VERSION   :   0.66
+# DATE      :   2018.02.06
+# VERSION   :   0.67
 #
 # DEPENDENCIES :
 #               Binaries: bash, grep, egrep, awk, mkdir, chmod, chown, 
@@ -679,7 +679,7 @@ yocto_run() {
 
         if [ "${ret}" == "0" ]; then 
           #remove tar archive after proper load
-          rm "${YOCTO_BASE_IMAGE_FILE%.bz2*}"
+          rm -f "${YOCTO_BASE_IMAGE_FILE%.bz2*}"
         fi 
         
         echo -e "\n\n"
@@ -1204,18 +1204,6 @@ set_sudoers() {
     exit
   fi
 
-  #check if general /etc/sudoers includes sycimg symount commands if not > add
-  subsystfiles_in_sudoers=$(sudo bash -c "cat "${sudoerr_file}" | egrep yocto-tools.*sycimg.*symount")
-  if [ -z "${subsystfiles_in_sudoers}" ]; then
-     sudo bash -c "echo -e \%yocto-tools   ALL\=NOPASSWD:  /usr/local/bin/sycimg, /usr/local/bin/symount >>"${sudoerr_file}" "
-  fi
-
-
-
-  if [ "${INSTALL_SERVICES}" != "yes" ]; then
-    return 0;
-  fi
-
   #check if #includedir /etc/sudoers.d exist if not add and create directory
   includedir_in_sudoers=$(sudo bash -c "cat "${sudoerr_file}" | egrep '\#includedir'.*'/etc/sudoers.d'")
   if [ -z "${includedir_in_sudoers}" ]; then
@@ -1226,14 +1214,30 @@ set_sudoers() {
   #add services related commands
   if [ -f "${sudoerr_inclusrfile}" ]; then
     echo -e "\nWarning: Sudoerrs file for given user already exist and will be erased"
-    sudo rm "${sudoerr_inclusrfile}"
+    sudo rm -f "${sudoerr_inclusrfile}"
   fi
 
-  sudo bash -c "echo -e  "${USER_NAME_HOST}"  ALL\=NOPASSWD:  /bin/systemctl start docker_user@"${USER_NAME_HOST}".service >>${sudoerr_inclusrfile}"
-  sudo bash -c "echo -e  "${USER_NAME_HOST}"  ALL\=NOPASSWD:  /bin/systemctl stop  docker_user@"${USER_NAME_HOST}".service >>${sudoerr_inclusrfile}"
-  sudo bash -c "echo -e  "${USER_NAME_HOST}"  ALL\=NOPASSWD:  /bin/systemctl stop  mounts_disconects@"${USER_NAME_HOST}".timer >>${sudoerr_inclusrfile}"
-  sudo bash -c "echo -e  "${USER_NAME_HOST}"  ALL\=NOPASSWD:  /bin/systemctl start mounts_disconects@"${USER_NAME_HOST}".timer >>${sudoerr_inclusrfile}"
 
+  #In case of acl groups sudo wants always password,
+  #but if we add users to sudoerr file user will not be propted for password
+
+  #In case of normal install
+  sudo bash -c "echo -e  "${USER_NAME_HOST}"  ALL\=NOPASSWD:  /usr/local/bin/sycimg, /usr/local/bin/symount >>${sudoerr_inclusrfile}"
+
+  #In case of buildmachine install
+  if [ "${INSTALL_SERVICES}" == "yes" ]; then
+    sudo bash -c "echo -e  "${USER_NAME_HOST}"  ALL\=NOPASSWD:  /bin/systemctl start docker_user@"${USER_NAME_HOST}".service >>${sudoerr_inclusrfile}"
+    sudo bash -c "echo -e  "${USER_NAME_HOST}"  ALL\=NOPASSWD:  /bin/systemctl stop  docker_user@"${USER_NAME_HOST}".service >>${sudoerr_inclusrfile}"
+    
+    sudo bash -c "echo -e  "${USER_NAME_HOST}"  ALL\=NOPASSWD:  /bin/systemctl start mounts_disconects@"${USER_NAME_HOST}".timer >>${sudoerr_inclusrfile}"    
+    sudo bash -c "echo -e  "${USER_NAME_HOST}"  ALL\=NOPASSWD:  /bin/systemctl stop  mounts_disconects@"${USER_NAME_HOST}".timer >>${sudoerr_inclusrfile}"
+    
+    sudo bash -c "echo -e  "${USER_NAME_HOST}"  ALL\=NOPASSWD:  /bin/systemctl disable  mounts_disconects@"${USER_NAME_HOST}".timer >>${sudoerr_inclusrfile}"
+    sudo bash -c "echo -e  "${USER_NAME_HOST}"  ALL\=NOPASSWD:  /bin/systemctl enable  mounts_disconects@"${USER_NAME_HOST}".timer >>${sudoerr_inclusrfile}"
+    
+    sudo bash -c "echo -e  "${USER_NAME_HOST}"  ALL\=NOPASSWD:  /bin/systemctl start mounts_disconects@"${USER_NAME_HOST}".service >>${sudoerr_inclusrfile}"
+    sudo bash -c "echo -e  "${USER_NAME_HOST}"  ALL\=NOPASSWD:  /bin/systemctl stop  mounts_disconects@"${USER_NAME_HOST}".service >>${sudoerr_inclusrfile}"
+  fi
 }
 
 install_files() {
@@ -1370,8 +1374,42 @@ install_files() {
       read -p "        >" yn
       if [ "$yn" = "y" ]||[ "$yn" = "yes" ]; then
         ${sudo} cp -f "${_tmp_install_dir}""/""${fle##*/}" "${fle}"
-        ${sudo} chown "${USER_NAME_HOST}" "${fle}"
-        ${sudo} chmod +xr "${fle}"
+        #${sudo} chown "${USER_NAME_HOST}" "${fle}"
+        #${sudo} chmod +xr "${fle}"
+
+        #ACL-rights for subsystem files and "yocto"
+        _ssfilesplusyocto=( "${fname}" ${_ssfiles[@]} )
+        for ssfle in "${_ssfilesplusyocto[@]}"; do
+          if [ "${fle##*/}" == "${ssfle}" ]; then
+            ${sudo} chown "${SUBSYSTEM_FILES_ACL_CHOWN}" "${fle}"
+            ${sudo} chmod "${SUBSYSTEM_FILES_ACL_CHMOD}" "${fle}"
+          fi
+        done
+
+        #ACL-rights for services
+        if [ ${fle##*.} == "service" ] || [ ${fle##*.} == "socket" ] || [ ${fle##*.} == "timer" ]; then
+          ${sudo} chown "${SERVICE_FILES_ACL_CHOWN}" "${fle}"
+          ${sudo} chmod "${SERVICE_FILES_ACL_CHMOD}" "${fle}"
+        fi
+
+        #ACL-rights for *.sh files
+        if [ ${fle##*.} == "sh" ]; then
+          ${sudo} chown "${OTHER_SH_ACL_CHOWN}" "${fle}"
+          ${sudo} chmod "${OTHER_SH_ACL_CHMOD}" "${fle}"
+        fi
+
+        #ACL-rights for *.docker files
+        if [ ${fle##*.} == "docker" ]; then
+          ${sudo} chown "${DOCKER_FILES_ACL_CHOWN}" "${fle}"
+          ${sudo} chmod "${DOCKER_FILES_ACL_CHMOD}" "${fle}"
+        fi
+
+        #ACL-rights for template file
+        if [ "${fle##*/}" == "${DOCKER_USER_BUILMACHINE_TEMPLATE_CONFIG_FNAME}" ]; then
+          ${sudo} chown "${TEMPLATE_FILE_ACL_CHOWN}" "${fle}"
+          ${sudo} chmod "${TEMPLATE_FILE_ACL_CHMOD}" "${fle}"
+        fi
+
 
         if [ "${fle##*/}" == "${DOCKER_USER_BUILMACHINE_TEMPLATE_CONFIG_FNAME}" ]; then
         #replacing settings(template) for buildmachine
@@ -1381,13 +1419,47 @@ install_files() {
       fi
     else
         local _inst_dir="${fle%/*}"
+
         if [ ! -e "${_inst_dir}" ]; then
           ${sudo} mkdir -p "${_inst_dir}";
           ${sudo} chown "${USER_NAME_HOST}" "${_inst_dir}"
         fi
         ${sudo} cp -f "${_tmp_install_dir}""/""${fle##*/}" "${fle}"
-        ${sudo} chown "${USER_NAME_HOST}" "${fle}"
-        ${sudo} chmod +xr "${fle}"
+        #${sudo} chown "${USER_NAME_HOST}" "${fle}"
+        #${sudo} chmod +xr "${fle}"
+
+        #ACL-rights for subsystem files and "yocto"
+        _ssfilesplusyocto=( "${fname}" ${_ssfiles[@]}  )
+        for ssfle in "${_ssfilesplusyocto[@]}"; do
+          if [ "${fle##*/}" == "${ssfle}" ]; then
+            ${sudo} chown "${SUBSYSTEM_FILES_ACL_CHOWN}" "${fle}"
+            ${sudo} chmod "${SUBSYSTEM_FILES_ACL_CHMOD}" "${fle}"
+          fi
+        done
+
+        #ACL-rights for services
+        if [ ${fle##*.} == "service" ] || [ ${fle##*.} == "socket" ] || [ ${fle##*.} == "timer" ]; then
+          ${sudo} chown "${SERVICE_FILES_ACL_CHOWN}" "${fle}"
+          ${sudo} chmod "${SERVICE_FILES_ACL_CHMOD}" "${fle}"
+        fi
+
+        #ACL-rights for *.sh files
+        if [ ${fle##*.} == "sh" ]; then
+          ${sudo} chown "${OTHER_SH_ACL_CHOWN}" "${fle}"
+          ${sudo} chmod "${OTHER_SH_ACL_CHMOD}" "${fle}"
+        fi
+
+        #ACL-rights for *.docker files
+        if [ ${fle##*.} == "docker" ]; then
+          ${sudo} chown "${DOCKER_FILES_ACL_CHOWN}" "${fle}"
+          ${sudo} chmod "${DOCKER_FILES_ACL_CHMOD}" "${fle}"
+        fi
+
+        #ACL-rights for template file
+        if [ "${fle##*/}" == "${DOCKER_USER_BUILMACHINE_TEMPLATE_CONFIG_FNAME}" ]; then
+          ${sudo} chown "${TEMPLATE_FILE_ACL_CHOWN}" "${fle}"
+          ${sudo} chmod "${TEMPLATE_FILE_ACL_CHMOD}" "${fle}"
+        fi
 
         #
         if [ "${fle##*/}" == "${DOCKER_USER_BUILMACHINE_TEMPLATE_CONFIG_FNAME}" ]; then
@@ -1455,6 +1527,10 @@ install_files() {
       rm "${DOCKER_USER_CONFIG_DIR}"/docker 2>/dev/null
     fi
 
+    echo -e "\nStopping docker_user service:\n"
+    ${sudo} systemctl stop docker_user@${USER_NAME_HOST}.service
+    sleep 5
+
     echo -e "\nUn-mounting all images:\n"
     /usr/local/bin/ymount unmount --unmount-all
     echo -e "\n"
@@ -1477,15 +1553,20 @@ install_files() {
       echo -e "  Example: /mnt/nas/build-aufs-docker/"
       read -p "        >" -e _prefix_path
 
-      #write storage settings on the end of settings file, last var rewrite previous ....
-      echo -e "\n">>"${DOCKER_USER_BUILMACHINE_TEMPLATE_CONFIG}"
-      echo 'EXT_MOUNT_DOCKER_STORAGE=''"'${_prefix_path%/*}'/$_USER/docker_imgs_storage.qemurawimg''"'>>"${DOCKER_USER_BUILMACHINE_TEMPLATE_CONFIG}"
+      #echo -e "\n">>"${DOCKER_USER_BUILMACHINE_TEMPLATE_CONFIG}"
+      #echo 'EXT_MOUNT_DOCKER_STORAGE=''"'${_prefix_path%/*}'/$_USER/docker_imgs_storage.qemurawimg''"'>>"${DOCKER_USER_BUILMACHINE_TEMPLATE_CONFIG}"
+
+      ${sudo} sed -i 's@.*EXT_MOUNT_DOCKER_STORAGE=.*@EXT_MOUNT_DOCKER_STORAGE='"${_prefix_path%/*}"'/$_USER/docker_imgs_storage.qemurawimg@' "${DOCKER_USER_BUILMACHINE_TEMPLATE_CONFIG}"
+
       echo -e "\n"
 
       _allpthtmp="${_prefix_path%/}""/$USER_NAME_HOST/docker_imgs_storage.qemurawimg"
 
     else
-      _allpthtmp=$(_USER="${USER_NAME_HOST}"; . "${DOCKER_USER_BUILMACHINE_TEMPLATE_CONFIG}"; echo $EXT_MOUNT_DOCKER_STORAGE)
+      #we dont want to run this script, only extract variables...
+      _allpthtm1=$( ${sudo} awk '{varname="EXT_MOUNT_DOCKER_STORAGE=";if(index($0,varname)){bla=$0;sub(varname,"",bla);gsub("\"","",bla);print bla }    }' "${DOCKER_USER_BUILMACHINE_TEMPLATE_CONFIG}" )
+      #eval..
+      _allpthtmp=$(_USER="${USER_NAME_HOST}"; eval echo "${_allpthtm1}" )
     fi
 
     echo -e "Docker storage for container images:"
@@ -1969,6 +2050,25 @@ main() {
     #>INSTALL_SERVICES="no", install_subsystem_files="yes"
 
   SUBSYSTEM_FILES="ycimg sycimg ymount symount"
+  #subsystem files includes this file
+  SUBSYSTEM_FILES_ACL_CHMOD="750"
+  SUBSYSTEM_FILES_ACL_CHOWN="root:yocto-tools"
+
+  #-rwr--r--
+  SERVICE_FILES_ACL_CHMOD="644"
+  SERVICE_FILES_ACL_CHOWN="root:root"
+
+  OTHER_SH_ACL_CHMOD="750"
+  OTHER_SH_ACL_CHOWN="root:root"
+
+  DOCKER_FILES_ACL_CHMOD="750"
+  DOCKER_FILES_ACL_CHOWN="${USER_NAME_HOST}:${USER_NAME_HOST}"
+
+  #during only services installation user will read
+  TEMPLATE_FILE_ACL_CHMOD="660"
+  TEMPLATE_FILE_ACL_CHOWN="root:root"
+  #TEMPLATE_CONFIG_FNAME
+
   YOCTO_TOOLS__RELEASE_FILES_BASE="/usr/local/bin/ycimg /usr/local/bin/sycimg \
                                     /usr/local/bin/ymount /usr/local/bin/symount\
                                     /usr/local/bin/umess.sh \
@@ -3174,82 +3274,84 @@ X0ZPTERFUn0iCiAgICBjaG93biAiJHtfVVNFUn0iOiIke19VU0VSfSIgLVIgIiR7T1BUX0ZPTERF
 Un0iCiAgICBjaG93biA6cm9vdCAiJHtPUFRfRk9MREVSfS9leGVjcm9vdCIKICAgIGNobW9kIDc3
 NyAiJHtPUFRfRk9MREVSfS9leGVjcm9vdCIKICAgIAogICAgI2NyZWF0ZSBmb2xkZXIgZm9yIG92
 ZXJsYXkgaW1hZ2UgRVhUX01PVU5UX0RPQ0tFUl9TVE9SQUdFCiAgICAjbWtkaXIgLXAgJHtFWFRf
-TU9VTlRfRE9DS0VSX1NUT1JBR0UlLyp9CiAgICAKICBmaQp9CgptbnRkb2NpbWcoKSB7CgogICNU
-T0RPOiBzZWMgaXNzdWUKICAjLiAiJHtPUFRfRk9MREVSfS9kb2NrZXIiCiAgI2V4dHJhY3Rpb24g
-b2YgdmFycyBmcm9tIHVzZXIncyBjb25maWcgZmlsZQogIEVYVF9NT1VOVF9ET0NLRVJfU1RPUkFH
-RT0kKGF3ayAne3Zhcm5hbWU9IkVYVF9NT1VOVF9ET0NLRVJfU1RPUkFHRT0iO2lmKGluZGV4KCQw
-LHZhcm5hbWUpKXtibGE9JDA7c3ViKHZhcm5hbWUsIiIsYmxhKTtnc3ViKCJcIiIsIiIsYmxhKTtw
-cmludCBibGEgfSAgICB9JyAiJHtPUFRfRk9MREVSfS9kb2NrZXIiICkKICBET0NLRVJfT1BUUz0k
-KGF3ayAne3Zhcm5hbWU9IkRPQ0tFUl9PUFRTPSI7aWYoaW5kZXgoJDAsdmFybmFtZSkpe2JsYT0k
-MDtzdWIodmFybmFtZSwiIixibGEpO2dzdWIoIlwiIiwiIixibGEpO3ByaW50IGJsYSB9ICAgIH0n
-ICIke09QVF9GT0xERVJ9L2RvY2tlciIgKQoKICByZXQ9IiIKICBlY2hvICJkb2NrZXJfdXNlcl9w
-cmVwOiBleHRfbW91bnRfZG9ja2VyX3N0b3JhZ2U9JEVYVF9NT1VOVF9ET0NLRVJfU1RPUkFHRSIK
-CiAgaWYgWyAhIC1kICIke1JVTlRJTUVfRk9MREVSX0lNQUdFU30iIF07IHRoZW4KICAgICNJcyBk
-b2NrZXIgc3RvcmFnZSBhdmFpbGFibGUsIGhhZCBiZWVuIG1vdW50ZWQgYmVmb3JlID8gPiBObyA+
-IG1vdW50IGRvY2tlciBzdG9yYWdlKGRvY2tlcmQgLWcpOgogICAgaWYgWyAtZiAiJHtFWFRfTU9V
-TlRfRE9DS0VSX1NUT1JBR0V9IiBdOyB0aGVuCiAgICAjZG9lcyBkb2NrZXItaW1hZ2UgZm9yIHN0
-b3JpbmcgZG9ja2VyIGltYWdlcyBleGlzdCA/ID4gWWVzID4gbW91bnQgdG8gL21udC8kVVNFUi92
-ZDIgCiAgICAgIHltb3VudCAtbiAtaT0iJHtkb2NrZXJtbnRwb2ludGlkfSIgLS11c2VyPSIke19V
-U0VSfSIgLW09IiR7RVhUX01PVU5UX0RPQ0tFUl9TVE9SQUdFfSIKICAgICAgX3JldD0iJD8iCiAg
-ICBmaQogIGZpCiAgaWYgWyAiJF9yZXQiICE9ICIwIiBdOyB0aGVuCiAgICBlY2hvICJFcnJvcjog
-UGxlYXNlIG1vdW50IGltYWdlIHRvIiIke1JVTlRJTUVfRk9MREVSX0lNQUdFU30gYnkgZm9sbG93
-aW5nIGNvbW1hbmQiCiAgICBlY2hvICIgICAgICAgJCB5bW91bnQgLW4gLWk9JHtkb2NrZXJtbnRw
-b2ludGlkfSIKICAgIHVtZXNzLnNoIC11ICIkX1VTRVIiIC1tICJFcnJvcjogUGxlYXNlIG1vdW50
-IGltYWdlIHRvIiIke1JVTlRJTUVfRk9MREVSX0lNQUdFU30gYnkgZm9sbG93aW5nIGNvbW1hbmQ6
-IFxuICAgICAgICQgeW1vdW50IC1uIC1pPSR7ZG9ja2VybW50cG9pbnRpZH0gXG4iCiAgICBleGl0
-ICIke19yZXR9IgogIGZpCn0KCm1haW4oKSB7CiAgX1VTRVI9IiQxIjsgZXhwb3J0IF9VU0VSCiAg
-X0FDVElPTj0iJDIiCgogIHltb3VudF9zZXR0aW5nc19hcnI9KCAkKC91c3IvbG9jYWwvYmluL3lt
-b3VudCBzZXR0aW5ncykgKQogIGV2YWwgIiR7eW1vdW50X3NldHRpbmdzX2FycltAXX0iCgogICgo
-ZG9ja2VybW50cG9pbnRpZD0ke1VTRVJfTE9PUERFVl9NQVh9LTEpKQogIGV4cG9ydCBkb2NrZXJt
-bnRwb2ludGlkCgogIEhPTUU9JChhd2sgLXYgY3Vzcj0kX1VTRVIgJ0JFR0lOe0ZTPSI6In17aWYo
-bWF0Y2goJDEsY3Vzcikpe3ByaW50ICQ2fX0nIC9ldGMvcGFzc3dkKQogIGV4cG9ydCBIT01FCgog
-IE9QVF9GT0xERVI9IiR7SE9NRX0vLmNvbmZpZy9kb2NrZXJfdXNlciI7IGV4cG9ydCBPUFRfRk9M
-REVSCgogIE9QVF9GT0xERVJfVEVNUExBVEU9L2V0Yy9kZWZhdWx0L2RvY2tlcl91c2VyX2RlZmF1
-bHQ7IGV4cG9ydCBPUFRfRk9MREVSX1RFTVBMQVRFCgogIFJVTlRJTUVfRk9MREVSX0lNQUdFUz0i
-L21udC8kX1VTRVIvdmQkZG9ja2VybW50cG9pbnRpZC9kb2NrZXIiOyBleHBvcnQgUlVOVElNRV9G
-T0xERVJfSU1BR0VTCgogIENPTV9TT0NLRVQ9Ii1IIHVuaXg6Ly8ke09QVF9GT0xERVJ9L2RvY2tl
-ci5zb2NrIjsgZXhwb3J0IENPTV9TT0NLRVQKCkJBU0hSQ19BREQ9IlwKCmRvY2tlcl91c2VyKCkg
-ewogIHBhcmFtcz1cIlwkQFwiCiAgLiBcIlwkSE9NRS8uY29uZmlnL2RvY2tlcl91c2VyL2RvY2tl
-clwiCiAgRE9DS0VSX1NPQ0tFVD1cJChwcmludGYgXCIlc1wiIFwiXCRET0NLRVJfT1BUU1wiIHwg
-Z3JlcCAtb1AgLWUgJygtSHwtLWhvc3QpXFcqXEsoXFMrKScpCiAgcGFyYW1zPVwiLUhcIlwiIFwi
-XCJcJHtET0NLRVJfU09DS0VUfVwiXCIgXCJcJHtwYXJhbXN9CiAgZG9ja2VyIFwke3BhcmFtc30K
-fQpleHBvcnQgLWYgZG9ja2VyX3VzZXIKIgpleHBvcnQgQkFTSFJDX0FERAoKICBpZiBbICEgLWUg
-IiR7T1BUX0ZPTERFUl9URU1QTEFURX0iIF07IHRoZW4KICAgIFRFTVBMQVRFX0FERF9ET0NLRVI9
-IkRPQ0tFUl9PUFRTPVwiLS1kbnMgOC44LjguOCAtLWRucyA4LjguNC40IC1nICR7UlVOVElNRV9G
-T0xERVJfSU1BR0VTfSAke0NPTV9TT0NLRVR9IC1wICR7T1BUX0ZPTERFUn0vZG9ja2VyLnBpZCAt
-LWV4ZWMtcm9vdD0ke09QVF9GT0xERVJ9L2V4ZWNyb290IFwiIgogICAgZXhwb3J0IFRFTVBMQVRF
-X0FERF9ET0NLRVIKICAgIFRFTVBMQVRFX0FERF9NT1VOVD0iRVhUX01PVU5UX0RPQ0tFUl9TVE9S
-QUdFPS9tbnQvbmFzX3JhaWQxMC8kX1VTRVIvaW1hZ2VzL2RvY2tlci9kb2NrZXJfaW1nc19zdG9y
-YWdlLnFlbXVyYXdpbWciOyAKICAgIGV4cG9ydCBURU1QTEFURV9BRERfTU9VTlQKICBmaQoKICBl
-Y2hvICJkb2NrZXJfdXNlcl9wcmVwOiBhY3Rpb249JF9BQ1RJT04iCiAgZWNobyAiZG9ja2VyX3Vz
-ZXJfcHJlcDogdXNlcj0kX1VTRVIiCiAgZWNobyAiZG9ja2VyX3VzZXJfcHJlcDogaG9tZT0kSE9N
-RSIKICBlY2hvICJkb2NrZXJfdXNlcl9wcmVwOiBvcHRfZm9sZGVyPSRPUFRfRk9MREVSIgogIGVj
-aG8gImRvY2tlcl91c2VyX3ByZXA6IG9wdF9mb2xkZXJfdGVtcGxhdGU9JE9QVF9GT0xERVJfVEVN
-UExBVEUiCiAgZWNobyAiZG9ja2VyX3VzZXJfcHJlcDogcnVudGltZV9mb2xkZXJfaW1hZ2VzPSRS
-VU5USU1FX0ZPTERFUl9JTUFHRVMiCiAgZWNobyAiZG9ja2VyX3VzZXJfcHJlcDogZG9ja2VyX21u
-dHBvaW50aWQ9JGRvY2tlcm1udHBvaW50aWQiCiAgZWNobyAiZG9ja2VyX3VzZXJfcHJlcDogdGVt
-cGxhdGVfYWRkX2RvY2tlcj0kVEVNUExBVEVfQUREX0RPQ0tFUiIKICBlY2hvICJkb2NrZXJfdXNl
-cl9wcmVwOiB0ZW1wbGF0ZV9hZGRfbW91bnQ9JFRFTVBMQVRFX0FERF9NT1VOVCIKCiAgaWYgWyAi
-JF9BQ1RJT04iID09ICJzdGFydCIgXTsgdGhlbgogICAgcHJlcGVudgogICAgbW50ZG9jaW1nCiAg
-ZWxpZiAgWyAiJF9BQ1RJT04iID09ICJ1bm1vdW50IiBdOyB0aGVuCiAgICAjVE9ETzogc2VjIGlz
-c3VlCiAgICAjLiAiJE9QVF9GT0xERVIvZG9ja2VyIgogICAgI2V4dHJhY3Rpb24gb2YgdmFycyBm
-cm9tIHVzZXIncyBjb25maWcgZmlsZQogICAgRVhUX01PVU5UX0RPQ0tFUl9TVE9SQUdFPSQoYXdr
-ICd7dmFybmFtZT0iRVhUX01PVU5UX0RPQ0tFUl9TVE9SQUdFPSI7aWYoaW5kZXgoJDAsdmFybmFt
-ZSkpe2JsYT0kMDtzdWIodmFybmFtZSwiIixibGEpO2dzdWIoIlwiIiwiIixibGEpO3ByaW50IGJs
-YSB9ICAgIH0nICIke09QVF9GT0xERVJ9L2RvY2tlciIgKQogICAgRE9DS0VSX09QVFM9JChhd2sg
-J3t2YXJuYW1lPSJET0NLRVJfT1BUUz0iO2lmKGluZGV4KCQwLHZhcm5hbWUpKXtibGE9JDA7c3Vi
-KHZhcm5hbWUsIiIsYmxhKTtnc3ViKCJcIiIsIiIsYmxhKTtwcmludCBibGEgfSAgICB9JyAiJHtP
-UFRfRk9MREVSfS9kb2NrZXIiICkKCiAgICB1bWVzcy5zaCAtdSAiJF9VU0VSIiAtbSAiSW5mbzog
-VW4tbW91bnRpbmcgZG9ja2VyIGltYWdlIFsvbW50LyRfVVNFUi92ZCR7ZG9ja2VybW50cG9pbnRp
-ZH06IFxuICAgICAgICAkIHltb3VudCB1bm1vdW50IC1uIC1pPSR7ZG9ja2VybW50cG9pbnRpZH1c
-biIKICAgIHltb3VudCB1bm1vdW50IC0tdXNlcj0iJF9VU0VSIiAtaT0iJHtkb2NrZXJtbnRwb2lu
-dGlkfSIKICAgIF9yZXQxPSQ/CiAgICBpZiBbICIke19yZXQxfSIgIT0gIjAiIF07IHRoZW4KICAg
-ICAgdW1lc3Muc2ggLXUgIiRfVVNFUiIgLW0gIkVycm9yOiBVbi1tb3VudGluZyAvbW50LyRfVVNF
-Ui92ZCR7ZG9ja2VybW50cG9pbnRpZH0gISEgXG4iCiAgICAgIGV4aXQgIiR7X3JldDF9IgogICAg
-ZWxzZQogICAgICB1bWVzcy5zaCAtdSAiJF9VU0VSIiAtbSAiSW5mbzogVW4tbW91bnRpbmcgL21u
-dC8kX1VTRVIvdmQke2RvY2tlcm1udHBvaW50aWR9IDogT0sgXG4iCiAgICAgIGV4aXQgIiR7X3Jl
-dDF9IgogICAgZmkKICBmaQoKfQoKCiNDaGVjayB1c2VyIGV4aXN0ZW5jZSBpbiBwYXJhbWF0ZXIg
-MQppZCAiJDEiIHx8IGV4aXQgMQoKbWFpbiAiJDEiICIkMiIK
+TU9VTlRfRE9DS0VSX1NUT1JBR0UlLyp9CiAgICAKICBmaQp9CgoKbW50ZG9jaW1nKCkgewoKICAj
+VE9ETzogc2VjIGlzc3VlCiAgIy4gIiR7T1BUX0ZPTERFUn0vZG9ja2VyIgogICNleHRyYWN0aW9u
+IG9mIHZhcnMgZnJvbSB1c2VyJ3MgY29uZmlnIGZpbGUKICBFWFRfTU9VTlRfRE9DS0VSX1NUT1JB
+R0U9JChhd2sgJ3t2YXJuYW1lPSJFWFRfTU9VTlRfRE9DS0VSX1NUT1JBR0U9IjtpZihpbmRleCgk
+MCx2YXJuYW1lKSl7YmxhPSQwO3N1Yih2YXJuYW1lLCIiLGJsYSk7Z3N1YigiXCIiLCIiLGJsYSk7
+cHJpbnQgYmxhIH0gICAgfScgIiR7T1BUX0ZPTERFUn0vZG9ja2VyIiApCiAgRE9DS0VSX09QVFM9
+JChhd2sgJ3t2YXJuYW1lPSJET0NLRVJfT1BUUz0iO2lmKGluZGV4KCQwLHZhcm5hbWUpKXtibGE9
+JDA7c3ViKHZhcm5hbWUsIiIsYmxhKTtnc3ViKCJcIiIsIiIsYmxhKTtwcmludCBibGEgfSAgICB9
+JyAiJHtPUFRfRk9MREVSfS9kb2NrZXIiICkKCiAgX3JldD0iMTAiCiAgZWNobyAiZG9ja2VyX3Vz
+ZXJfcHJlcDogZXh0X21vdW50X2RvY2tlcl9zdG9yYWdlPSRFWFRfTU9VTlRfRE9DS0VSX1NUT1JB
+R0UiCgogIGlmIFsgISAtZCAiJHtSVU5USU1FX0ZPTERFUl9JTUFHRVN9IiBdOyB0aGVuCiAgICAj
+SXMgZG9ja2VyIHN0b3JhZ2UgYXZhaWxhYmxlLCBoYWQgYmVlbiBtb3VudGVkIGJlZm9yZSA/ID4g
+Tm8gPiBtb3VudCBkb2NrZXIgc3RvcmFnZShkb2NrZXJkIC1nKToKICAgIGlmIFsgLWYgIiR7RVhU
+X01PVU5UX0RPQ0tFUl9TVE9SQUdFfSIgXTsgdGhlbgogICAgI2RvZXMgZG9ja2VyLWltYWdlIGZv
+ciBzdG9yaW5nIGRvY2tlciBpbWFnZXMgZXhpc3QgPyA+IFllcyA+IG1vdW50IHRvIC9tbnQvJFVT
+RVIvdmQyIAogICAgICB5bW91bnQgLW4gLWk9IiR7ZG9ja2VybW50cG9pbnRpZH0iIC0tdXNlcj0i
+JHtfVVNFUn0iIC1tPSIke0VYVF9NT1VOVF9ET0NLRVJfU1RPUkFHRX0iCiAgICAgIF9yZXQ9IiQ/
+IgogICAgZWxzZQogICAgIF9yZXQ9IjkiCiAgICAgZWNobyAiRXJyb3I6IEZpbGUgbm90IGZvdW5k
+OiAke0VYVF9NT1VOVF9ET0NLRVJfU1RPUkFHRX0iCiAgICBmaQoKICBmaQogIGlmIFsgIiRfcmV0
+IiAhPSAiMCIgXTsgdGhlbgogICAgZWNobyAiRXJyb3I6IFBsZWFzZSBtb3VudCBpbWFnZSB0byIi
+JHtSVU5USU1FX0ZPTERFUl9JTUFHRVN9IGJ5IGZvbGxvd2luZyBjb21tYW5kIgogICAgZWNobyAi
+ICAgICAgICQgeW1vdW50IC1uIC1pPSR7ZG9ja2VybW50cG9pbnRpZH0iCiAgICB1bWVzcy5zaCAt
+dSAiJF9VU0VSIiAtbSAiRXJyb3I6IFBsZWFzZSBtb3VudCBpbWFnZSB0byIiJHtSVU5USU1FX0ZP
+TERFUl9JTUFHRVN9IGJ5IGZvbGxvd2luZyBjb21tYW5kOiBcbiAgICAgICAkIHltb3VudCAtbiAt
+aT0ke2RvY2tlcm1udHBvaW50aWR9IFxuIgogICAgZXhpdCAiJHtfcmV0fSIKICBmaQp9CgptYWlu
+KCkgewogIF9VU0VSPSIkMSI7IGV4cG9ydCBfVVNFUgogIF9BQ1RJT049IiQyIgoKICB5bW91bnRf
+c2V0dGluZ3NfYXJyPSggJCgvdXNyL2xvY2FsL2Jpbi95bW91bnQgc2V0dGluZ3MpICkKICBldmFs
+ICIke3ltb3VudF9zZXR0aW5nc19hcnJbQF19IgoKICAoKGRvY2tlcm1udHBvaW50aWQ9JHtVU0VS
+X0xPT1BERVZfTUFYfS0xKSkKICBleHBvcnQgZG9ja2VybW50cG9pbnRpZAoKICBIT01FPSQoYXdr
+IC12IGN1c3I9JF9VU0VSICdCRUdJTntGUz0iOiJ9e2lmKG1hdGNoKCQxLGN1c3IpKXtwcmludCAk
+Nn19JyAvZXRjL3Bhc3N3ZCkKICBleHBvcnQgSE9NRQoKICBPUFRfRk9MREVSPSIke0hPTUV9Ly5j
+b25maWcvZG9ja2VyX3VzZXIiOyBleHBvcnQgT1BUX0ZPTERFUgoKICBPUFRfRk9MREVSX1RFTVBM
+QVRFPS9ldGMvZGVmYXVsdC9kb2NrZXJfdXNlcl9kZWZhdWx0OyBleHBvcnQgT1BUX0ZPTERFUl9U
+RU1QTEFURQoKICBSVU5USU1FX0ZPTERFUl9JTUFHRVM9Ii9tbnQvJF9VU0VSL3ZkJGRvY2tlcm1u
+dHBvaW50aWQvZG9ja2VyIjsgZXhwb3J0IFJVTlRJTUVfRk9MREVSX0lNQUdFUwoKICBDT01fU09D
+S0VUPSItSCB1bml4Oi8vJHtPUFRfRk9MREVSfS9kb2NrZXIuc29jayI7IGV4cG9ydCBDT01fU09D
+S0VUCgpCQVNIUkNfQUREPSJcCgpkb2NrZXJfdXNlcigpIHsKICBwYXJhbXM9XCJcJEBcIgogIC4g
+XCJcJEhPTUUvLmNvbmZpZy9kb2NrZXJfdXNlci9kb2NrZXJcIgogIERPQ0tFUl9TT0NLRVQ9XCQo
+cHJpbnRmIFwiJXNcIiBcIlwkRE9DS0VSX09QVFNcIiB8IGdyZXAgLW9QIC1lICcoLUh8LS1ob3N0
+KVxXKlxLKFxTKyknKQogIHBhcmFtcz1cIi1IXCJcIiBcIlwiXCR7RE9DS0VSX1NPQ0tFVH1cIlwi
+IFwiXCR7cGFyYW1zfQogIGRvY2tlciBcJHtwYXJhbXN9Cn0KZXhwb3J0IC1mIGRvY2tlcl91c2Vy
+CiIKZXhwb3J0IEJBU0hSQ19BREQKCiAgaWYgWyAhIC1lICIke09QVF9GT0xERVJfVEVNUExBVEV9
+IiBdOyB0aGVuCiAgICBURU1QTEFURV9BRERfRE9DS0VSPSJET0NLRVJfT1BUUz1cIi0tZG5zIDgu
+OC44LjggLS1kbnMgOC44LjQuNCAtZyAke1JVTlRJTUVfRk9MREVSX0lNQUdFU30gJHtDT01fU09D
+S0VUfSAtcCAke09QVF9GT0xERVJ9L2RvY2tlci5waWQgLS1leGVjLXJvb3Q9JHtPUFRfRk9MREVS
+fS9leGVjcm9vdCBcIiIKICAgIGV4cG9ydCBURU1QTEFURV9BRERfRE9DS0VSCiAgICBURU1QTEFU
+RV9BRERfTU9VTlQ9IkVYVF9NT1VOVF9ET0NLRVJfU1RPUkFHRT0vbW50L25hc19yYWlkMTAvJF9V
+U0VSL2ltYWdlcy9kb2NrZXIvZG9ja2VyX2ltZ3Nfc3RvcmFnZS5xZW11cmF3aW1nIjsgCiAgICBl
+eHBvcnQgVEVNUExBVEVfQUREX01PVU5UCiAgZmkKCiAgZWNobyAiZG9ja2VyX3VzZXJfcHJlcDog
+YWN0aW9uPSRfQUNUSU9OIgogIGVjaG8gImRvY2tlcl91c2VyX3ByZXA6IHVzZXI9JF9VU0VSIgog
+IGVjaG8gImRvY2tlcl91c2VyX3ByZXA6IGhvbWU9JEhPTUUiCiAgZWNobyAiZG9ja2VyX3VzZXJf
+cHJlcDogb3B0X2ZvbGRlcj0kT1BUX0ZPTERFUiIKICBlY2hvICJkb2NrZXJfdXNlcl9wcmVwOiBv
+cHRfZm9sZGVyX3RlbXBsYXRlPSRPUFRfRk9MREVSX1RFTVBMQVRFIgogIGVjaG8gImRvY2tlcl91
+c2VyX3ByZXA6IHJ1bnRpbWVfZm9sZGVyX2ltYWdlcz0kUlVOVElNRV9GT0xERVJfSU1BR0VTIgog
+IGVjaG8gImRvY2tlcl91c2VyX3ByZXA6IGRvY2tlcl9tbnRwb2ludGlkPSRkb2NrZXJtbnRwb2lu
+dGlkIgogIGVjaG8gImRvY2tlcl91c2VyX3ByZXA6IHRlbXBsYXRlX2FkZF9kb2NrZXI9JFRFTVBM
+QVRFX0FERF9ET0NLRVIiCiAgZWNobyAiZG9ja2VyX3VzZXJfcHJlcDogdGVtcGxhdGVfYWRkX21v
+dW50PSRURU1QTEFURV9BRERfTU9VTlQiCgogIGlmIFsgIiRfQUNUSU9OIiA9PSAic3RhcnQiIF07
+IHRoZW4KICAgIHByZXBlbnYKICAgIG1udGRvY2ltZwogIGVsaWYgIFsgIiRfQUNUSU9OIiA9PSAi
+dW5tb3VudCIgXTsgdGhlbgogICAgI1RPRE86IHNlYyBpc3N1ZQogICAgIy4gIiRPUFRfRk9MREVS
+L2RvY2tlciIKICAgICNleHRyYWN0aW9uIG9mIHZhcnMgZnJvbSB1c2VyJ3MgY29uZmlnIGZpbGUK
+ICAgIEVYVF9NT1VOVF9ET0NLRVJfU1RPUkFHRT0kKGF3ayAne3Zhcm5hbWU9IkVYVF9NT1VOVF9E
+T0NLRVJfU1RPUkFHRT0iO2lmKGluZGV4KCQwLHZhcm5hbWUpKXtibGE9JDA7c3ViKHZhcm5hbWUs
+IiIsYmxhKTtnc3ViKCJcIiIsIiIsYmxhKTtwcmludCBibGEgfSAgICB9JyAiJHtPUFRfRk9MREVS
+fS9kb2NrZXIiICkKICAgIERPQ0tFUl9PUFRTPSQoYXdrICd7dmFybmFtZT0iRE9DS0VSX09QVFM9
+IjtpZihpbmRleCgkMCx2YXJuYW1lKSl7YmxhPSQwO3N1Yih2YXJuYW1lLCIiLGJsYSk7Z3N1Yigi
+XCIiLCIiLGJsYSk7cHJpbnQgYmxhIH0gICAgfScgIiR7T1BUX0ZPTERFUn0vZG9ja2VyIiApCgog
+ICAgdW1lc3Muc2ggLXUgIiRfVVNFUiIgLW0gIkluZm86IFVuLW1vdW50aW5nIGRvY2tlciBpbWFn
+ZSBbL21udC8kX1VTRVIvdmQke2RvY2tlcm1udHBvaW50aWR9OiBcbiAgICAgICAgJCB5bW91bnQg
+dW5tb3VudCAtbiAtaT0ke2RvY2tlcm1udHBvaW50aWR9XG4iCiAgICB5bW91bnQgdW5tb3VudCAt
+LXVzZXI9IiRfVVNFUiIgLWk9IiR7ZG9ja2VybW50cG9pbnRpZH0iCiAgICBfcmV0MT0kPwogICAg
+aWYgWyAiJHtfcmV0MX0iICE9ICIwIiBdOyB0aGVuCiAgICAgIHVtZXNzLnNoIC11ICIkX1VTRVIi
+IC1tICJFcnJvcjogVW4tbW91bnRpbmcgL21udC8kX1VTRVIvdmQke2RvY2tlcm1udHBvaW50aWR9
+ICEhIFxuIgogICAgICBleGl0ICIke19yZXQxfSIKICAgIGVsc2UKICAgICAgdW1lc3Muc2ggLXUg
+IiRfVVNFUiIgLW0gIkluZm86IFVuLW1vdW50aW5nIC9tbnQvJF9VU0VSL3ZkJHtkb2NrZXJtbnRw
+b2ludGlkfSA6IE9LIFxuIgogICAgICBleGl0ICIke19yZXQxfSIKICAgIGZpCiAgZmkKCn0KCgoj
+Q2hlY2sgdXNlciBleGlzdGVuY2UgaW4gcGFyYW1hdGVyIDEKaWQgIiQxIiB8fCBleGl0IDEKCm1h
+aW4gIiQxIiAiJDIiCg==
 
 /lib/systemd/system/docker_user_prep@.service
 W1VuaXRdCkRlc2NyaXB0aW9uPUdlbmVyYXRlcyBzZXR0aW5ncyBhbmQgZW52IGZvciBkb2NrZXJf

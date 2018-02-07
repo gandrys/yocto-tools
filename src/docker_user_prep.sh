@@ -67,6 +67,7 @@ prepenv() {
   fi
 }
 
+
 mntdocimg() {
 
   #TODO: sec issue
@@ -75,7 +76,7 @@ mntdocimg() {
   EXT_MOUNT_DOCKER_STORAGE=$(awk '{varname="EXT_MOUNT_DOCKER_STORAGE=";if(index($0,varname)){bla=$0;sub(varname,"",bla);gsub("\"","",bla);print bla }    }' "${OPT_FOLDER}/docker" )
   DOCKER_OPTS=$(awk '{varname="DOCKER_OPTS=";if(index($0,varname)){bla=$0;sub(varname,"",bla);gsub("\"","",bla);print bla }    }' "${OPT_FOLDER}/docker" )
 
-  ret=""
+  _ret="10"
   echo "docker_user_prep: ext_mount_docker_storage=$EXT_MOUNT_DOCKER_STORAGE"
 
   if [ ! -d "${RUNTIME_FOLDER_IMAGES}" ]; then
@@ -84,7 +85,11 @@ mntdocimg() {
     #does docker-image for storing docker images exist ? > Yes > mount to /mnt/$USER/vd2 
       ymount -n -i="${dockermntpointid}" --user="${_USER}" -m="${EXT_MOUNT_DOCKER_STORAGE}"
       _ret="$?"
+    else
+     _ret="9"
+     echo "Error: File not found: ${EXT_MOUNT_DOCKER_STORAGE}"
     fi
+
   fi
   if [ "$_ret" != "0" ]; then
     echo "Error: Please mount image to""${RUNTIME_FOLDER_IMAGES} by following command"
