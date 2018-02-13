@@ -623,7 +623,7 @@ yocto_env_prepare_dirs_in_image () {
 
     if [ "$_used_space" -lt 3 ]; then 
 
-      echo " The image is most pobably blank (used space <3%) and partialy prepaired for given user."
+      echo " The image is most probably blank (used space <3%) and partially prepared for given user."
       echo ""
       echo " Do you wanna create folders in image in order to mount image properly for current user ? y/n"
       
