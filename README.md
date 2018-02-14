@@ -242,7 +242,7 @@ $ sudo systemctl start mounts_disconects@$USER.service
 
 
 
-## 6. Yocto-tools and Definition of Build Environment
+## 6. Yocto-tools and Definition of Build Environment by dockerfiles
 
 As have been described before, docker provide isolation from host's env.  
 Definition of running environment for yocto build is stored in dockerfiles  
@@ -265,5 +265,8 @@ Definition of running environment is composed from two dockerfiles:
    - User can copy this file and modify it 
    - In order to rebuild image with same name of dockerfile  
      old image have to be removed from docker 
-   
 
+     
+**Note.:  
+Sudo password inside all containers is stored in following file in container:
+/userpassword**
