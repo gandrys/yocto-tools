@@ -1,12 +1,29 @@
 
-# *yocto-tools [Andrys Jiri, 2018.02.07]*  
+# *yocto-tools [Andrys Jiri, 2018.03.26]*  
 
  Author        : Jiri Andrys  
  Maintainer    : Jiri Andrys  
  Contributors  : Jiri Andrys  
   
+# 1. Contents:
 
-## 1. Overview and Motivation
+* [2. Overview](#2-overview)
+* [3. Getting Started](#3-getting-started) 
+  * [3.1 Installation](#31-installation)
+  * [3.2 Create Image](#32-create-image)
+  * [3.3 Run Virtual Environment](#33-run-virtual-environment)
+  * [3.4 Run Virtual Environment in Windows](#34-run-virtual-environment-in-windows)
+* [4. Dependency List](#4-dependency-list)
+* [5. Architecture](#5-architecture)
+* [6. Buildmachine Setup](#6-buildmachine-setup)
+  * [6.1 Buildmachine and Systemd Services](#61-buildmachine-and-systemd-services)
+    * [Start/Stop docker-user service](#startstop-docker-user-service)
+    * [Enable/Disable scheduled auto-umounts](#enabledisable-scheduled-auto-umounts)
+    * [Manually unmount all yocto-tools's mounts](#manually-unmount-all-yocto-toolss-mounts)
+* [7. Yocto-tools and Definition of Build Environment by dockerfiles](#7-yocto-tools-and-definition-of-build-environment-by-dockerfiles)
+
+
+# 2. Overview
 The `yocto-tools` helps to maintain multiple yocto environments/BSPs 
 and hold host's dependencies in shape.
 Package is designed for people who porting software to different boards
@@ -31,7 +48,6 @@ then just continue work without necessity to recreate entire yocto-environment.
 Moreover, it is also possible to use yocto environment of someone else, 
 just copy virtual disk to any machine and continue working.    
 
-\pagebreak
   
 Yocto-tools fully support build machine concept(one common machine for builds).  
 Develepers usually do not want to create magical releases, 
@@ -80,13 +96,16 @@ Yocto-tools has been tested on following systems:
  * Ubuntu 14.04(64bit)
  * Ubuntu 16.04(64bit with docker) 
  * Fedora 24(64bit)  
- * Windows 7(32bit)[bug in this release]
- * Windows 7(64bit)[bug in this release]
-  
 
-## 2. Getting Started 
 
-### 2.1 Installation
+# 3. Getting Started 
+
+## 3.1 Installation
+
+Yocto-tools can be installed two different ways.
+First is single-user mode, which will not install any systemd services.
+Second is multi-user mode/buildmachine mode which will install docker-user services,
+where every user will have own dockerd deamon.
 
 Because of yocto-tools during installation copy files to system folders,  
 given user have to be member of sudo group. 
@@ -98,6 +117,7 @@ and we can remove given user from sudo group.
 **Before we start installation ACL's group called yocto-tools have to be created in host.**  
 
 **In order to use yocto-tools user have to be member of yocto-tools ACL's group.**
+
 
 
 1. In case of normal PC(linux), please call following command as normal user:  
@@ -120,11 +140,11 @@ Note.:
    Characters "./" are important, please do not skip them during installation.
 
 
-### 2.2 Create Image
+## 3.2 Create Image
 >`$ yocto cimg`  
 
 
-### 2.3 "Run" in Linux
+## 3.3 Run Virtual Environment
 - In case that we want to use docker:  
 >`$ yocto `  
 
@@ -133,11 +153,11 @@ Note.:
 >`$ ymount `  
 
 
-### 2.4 "Run" in Windows
+## 3.4 Run Virtual Environment in Windows
 >`$ yocto `  
 
 
-## 3. Dependency List:
+# 4. Dependency List
 
 1. Standard tools, included in almost all kind of distros and installed by default:  
    >` bash, mkdir, chmod, chown, mount, grep, egrep, awk, id, base64, bunzip2, lsof`  
@@ -150,15 +170,14 @@ Note.:
    Docker, VirtualBox, docker-machine will be installed automatically. ` 
 
 
-## 4. Architecture
+# 5. Architecture
 
 
 ![](./new_architecture_hlp.png )
+![](./doc/new_architecture_hlp.png )
 
-\pagebreak
 
-
-## 5. Buildmachine Setup
+# 6. Buildmachine Setup
 
 When we select **--install_services** during installation step,  
 systemd services related to docker per user("docker_user") will be installed.  
@@ -204,45 +223,43 @@ In order to update all tools admin of buildmachine should run:
 
 ```
 $ yocto install --install-subsystem-files --install-services  
-```
+```   
 
 During install we should not replace **docker_user_default**.  
 
 Please take a look to architecture(doc folder) and to sources in order to understand well.
 
-\pagebreak
+
+## 6.1 Buildmachine and Systemd Services
 
 
-### 5.1 Buildmachine and systemd services:
-
-
-#### Start/Stop docker-user service for given user:
+### Start/Stop docker-user service
 ```
 $ sudo systemctl start docker_user@$USER.service
-```
+```  
 ```
 $ sudo systemctl stop docker_user@$USER.service
-```
+```   
 
 
-#### Enable/Disable scheduled auto-umounts for given user:
-```
+### Enable/Disable scheduled auto-umounts
+```   
 $ sudo systemctl enable mounts_disconects@$USER.timer
-```
-```
+```   
+```   
 $ sudo systemctl disable mounts_disconects@$USER.timer
-```
+```   
 
 
-#### Manually unmount all yocto-tools's mounts for given user:
+### Manually unmount all yocto-tools's mounts
 ```
 $ sudo systemctl start mounts_disconects@$USER.service
-```
+```  
 
 
 
 
-## 6. Yocto-tools and Definition of Build Environment by dockerfiles
+# 7. Yocto-tools and Definition of Build Environment by dockerfiles
 
 As have been described before, docker provide isolation from host's env.  
 Definition of running environment for yocto build is stored in dockerfiles  
@@ -254,7 +271,7 @@ Definition of running environment is composed from two dockerfiles:
    
 1. **"\*yocto_base.v\*.docker"** :
    - Should not be modified and contains most of data
-   - In order to speed up process and also for offline mode
+   - In order to speed up process and also for offline mode(yocto offline build)
    - Prepared image can be stored as **"\*yocto_base.v\*.docker.tar.bz2"**
      During installation, yocto-tools check docker-image-file in current directory
      and if exist copy it to user's folder for later use. 

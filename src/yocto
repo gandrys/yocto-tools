@@ -2,8 +2,8 @@
 #====================================================================
 # NAME      :   yocto
 # AUTHOR    :   Andrys Jiri
-# DATE      :   2018.02.06
-# VERSION   :   0.67
+# DATE      :   2018.03.26
+# VERSION   :   0.68
 #
 # DEPENDENCIES :
 #               Binaries: bash, grep, egrep, awk, mkdir, chmod, chown, 
@@ -25,7 +25,6 @@
 #               for systemd supported OS.
 #
 # TESTED ENV  :
-#               Windows 7 Professional"   32/64bit
 #               Ubuntu1604:               "builmachine mode(multi-user) mode", "single-user mode"
 #               Ubuntu1404:               "single-user mode"
 #               Fedora23:                 "single-user mode"
@@ -330,8 +329,16 @@ docker_identify() {
     _dcmd="docker_user"
     #{ Is daemon running ?
     tst=$("${_dcmd}" ps); ret=$?
-    if [ "$ret" != "0" ]; then 
-      echo -e "  Error: Please start service by command: \n         $ sudo systemctl start docker_user@${USER_NAME_HOST}.service"; return 1
+    if [ "$ret" != "0" ]; then
+      echo -e "  Warning : docker_user@${USER_NAME_HOST}.service is not running, service start !";
+      bla=$(sudo systemctl start docker_user@${USER_NAME_HOST}.service 2>/dev/null)
+      ret=$?
+      if [ "$ret" != "0" ]; then
+        echo -e "  Error: Unable to start docker_user@${USER_NAME_HOST}.service "; return 1
+      else
+        echo -e "          : OK"
+      fi
+      return 1;
     fi
     #}
   fi
@@ -1321,7 +1328,7 @@ install_files() {
       continue
     fi
 
-    #TODO: 2018.01.04 Skip template file(docker_user_default) copying in case :
+    #Skip template file(docker_user_default) copying in case :
     #     "${INSTALL_SERVICES}" == "yes" && "${INSTALL_SUBSYSTEM_FILES}" == "no"
     #additional things are needed:later
     #4 installation types:
@@ -1783,6 +1790,18 @@ echo -e "\
   | ->Run ycimg tool and create image for storing yocto environment
   |   Unavailable in Windows
 
+  COMMAND: mount
+  | ->Run ymount with parameter mount
+  |   Unavailable in Windows
+
+  COMMAND: umount
+  | ->Run ymount with parameter umount
+  |   Unavailable in Windows
+
+  COMMAND: info
+  | ->Run ymount with parameter info
+  |   Unavailable in Windows
+
   COMMAND: { run | '""' }
   |--OPTIONS: --custom-docker-file| --custom-docker-file="DOCKER_FILE" | -c="DOCKER_FILE" |-c, --restart
   |
@@ -2095,7 +2114,7 @@ main() {
   #Selectable by user
 
   #4)run     : only necessary files are docker file and the they are in DOCKER_BUILD_DIRECTORY      :
-  #TODO:!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!2017.12.21
+  #
 
   #--custom-img(choosing user_image),(without this input parameter always gives user choice from docker_build_dir)
   # cdbimg(create base image )(choosing base image)
@@ -2129,6 +2148,38 @@ main() {
         
         operation="create_yocto_image_storage"
       ;;
+
+
+      mount)
+
+        if [ "${OS_STRING}" != "NATIVE_LINUX" ]; then
+          echo -e "\n  This command/option is not available in windows systems,\n please create image in Linux"
+          exit 1
+        fi
+
+        operation="ymount_mount"
+      ;;
+
+      umount)
+
+        if [ "${OS_STRING}" != "NATIVE_LINUX" ]; then
+          echo -e "\n  This command/option is not available in windows systems,\n please create image in Linux"
+          exit 1
+        fi
+
+        operation="ymount_umount"
+      ;;
+
+      info)
+
+        if [ "${OS_STRING}" != "NATIVE_LINUX" ]; then
+          echo -e "\n  This command/option is not available in windows systems,\n please create image in Linux"
+          exit 1
+        fi
+
+        operation="ymount_info"
+      ;;
+
       
       run)
         operation="run"
@@ -2238,7 +2289,6 @@ main() {
     ret=$?
     [ "${ret}" != "0" ] && exit 1
 
-    #TODO: here !!
     #""
     if [ -z "${prep_yocto_user_docker_file}"  ]; then
       #find docker files build directory and propt user to select one
@@ -2327,6 +2377,13 @@ main() {
   
     update_script_data2 "${YOCTO_TOOLS__RELEASE_FILES_BASE}" "${fls_dir}" "${BASE64_DATA_DOCKER_BUILD_DIRECTORY}" "${BASE64_DATA_TEMP_INSTALLATION_DIRECTORY}"
 
+
+  elif [ "$operation" == "ymount_mount" ]; then
+    ymount mount
+  elif [ "$operation" == "ymount_umount" ]; then
+    ymount umount
+  elif [ "$operation" == "ymount_info" ]; then
+    ymount info
   fi
   
   echo -e "\n"
