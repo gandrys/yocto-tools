@@ -145,11 +145,16 @@ Note.:
 
 
 ## 3.3 Run Virtual Environment
-- In case that we want to use docker:  
+- After following command user will appear in docker environment, 
+  where we can run bitbake(**/opt/$USER/works/**)
+- In case that we want to use docker or build virtual disk from someone else :  
 >`$ yocto `  
 
 
-- In case that we do not want to use docker, then just run:  
+- In case that we do not want to use docker, and host system have all dependencies then 
+  user can only mount virtual disk:
+- If user build yocto environment out of docker, Yocto toolchain will be created for host's env,
+  therefore this is not suggested approach, unless given user knows yocto/oe/toolchain well ! 
 >`$ ymount `  
 
 
@@ -203,10 +208,10 @@ and can be changed per buildmachine.
 **EXT_MOUNT_DOCKER_STORAGE="/*/docker_imgs_storage.qemurawimg"**   
   This virtual image can be created automatically during buildmachine installation.
 - In order to protect data on mounted virtual disks, 
-  "mounts_disconects@USER.service" is installed 
+  "mounts_disconects@$USER.service" is installed 
   and provides unmouting of all virtual disks.
-  Another  unit mounts_disconects@USER.timer serve as trigger.
-  Default trigger time is set to: 23:45, everyday. 
+  Another  unit mounts_disconects@$USER.timer serve as trigger.
+  Default trigger time is set to 22:45 . 
 
 We suppose that somewhere in NAS in network we have common place to store all images for all "build-users".  
 After "Buildmachine" ops install yocto-tools's services for user, then dockerd setings is located in  
