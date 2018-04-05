@@ -2,8 +2,8 @@
 #====================================================================
 # NAME      :   yocto
 # AUTHOR    :   Andrys Jiri
-# DATE      :   2018.03.26
-# VERSION   :   0.68
+# DATE      :   2018.04.05
+# VERSION   :   0.69
 #
 # DEPENDENCIES :
 #               Binaries: bash, grep, egrep, awk, mkdir, chmod, chown, 
@@ -1292,6 +1292,36 @@ install_files() {
   
   #recreate_files "${_files}"
 
+  #test if group exist in system
+  _grpexist=$(cat /etc/group | grep "${SUBSYSTEM_FILES_YOCTO_TOOLS_GROUP_NAME}:")
+  if [ -z "${_grpexist}" ]; then
+    echo -e "\nWarning: ${SUBSYSTEM_FILES_YOCTO_TOOLS_GROUP_NAME} group does not exist.\n"
+    echo -e "           Create ${SUBSYSTEM_FILES_YOCTO_TOOLS_GROUP_NAME} group and add user to group:\n"
+
+    #get last gid <500 +1
+    ygid=$(awk 'BEGIN {FS=":"} {if($3<500){print $3}}' /etc/group | sort -g | awk 'END {gid=$0+1;if(gid<500){print gid}}')
+    if [ -z "${ygid}" ]; then
+      echo -e "\nError: Unable to create ${SUBSYSTEM_FILES_YOCTO_TOOLS_GROUP_NAME} group.Please create group manually.\nExit"
+      exit 1
+    fi
+    ${sudo} groupadd -g "${ygid}" "${SUBSYSTEM_FILES_YOCTO_TOOLS_GROUP_NAME}"
+
+    _grpexist=$(cat /etc/group | grep "${SUBSYSTEM_FILES_YOCTO_TOOLS_GROUP_NAME}:")
+    if [ -z "${_grpexist}" ]; then
+      echo -e "\nError: Unable to create ${SUBSYSTEM_FILES_YOCTO_TOOLS_GROUP_NAME} group.Please create group manually.\nExit"
+      exit 2
+    fi
+
+    ${sudo} gpasswd ${SUBSYSTEM_FILES_YOCTO_TOOLS_GROUP_NAME} -a "${USER_NAME_HOST}"
+    #
+    _ismember=$(cat /etc/group | egrep "${SUBSYSTEM_FILES_YOCTO_TOOLS_GROUP_NAME}:.*${USER_NAME_HOST}")
+    if [ -z "${_ismember}" ]; then
+      echo -e "\nError: Unable to add user to ${SUBSYSTEM_FILES_YOCTO_TOOLS_GROUP_NAME} group.Please do it manually.\nExit"
+      exit 3
+    fi
+
+  fi
+
   recreate_files2 "${fname}" "${_tmp_install_dir}" base64fles
 
   retval=$?
@@ -1571,8 +1601,14 @@ install_files() {
 
     else
       #we dont want to run this script, only extract variables...
-      _allpthtm1=$( ${sudo} awk '{varname="EXT_MOUNT_DOCKER_STORAGE=";if(index($0,varname)){bla=$0;sub(varname,"",bla);gsub("\"","",bla);print bla }    }' "${DOCKER_USER_BUILMACHINE_TEMPLATE_CONFIG}" )
+      _allpthtm1=( $( ${sudo} awk '{varname="EXT_MOUNT_DOCKER_STORAGE=";if(index($0,varname)){bla=$0;sub(varname,"",bla);gsub("\"","",bla);print bla }    }' "${DOCKER_USER_BUILMACHINE_TEMPLATE_CONFIG}" ) )
+      if [ ! "${#_allpthtm1[@]}" -eq "1" ]; then
+        echo -e "\n Error: Unsupported format of template file. Key duplicity is not supported."
+        echo -e   "        Please run installation again and replace ${DOCKER_USER_BUILMACHINE_TEMPLATE_CONFIG} by default one."
+        exit 1
+      fi
       #eval..
+      #NOTE: multiple EXT_MOUNT.... is not supported now... have to be only one
       _allpthtmp=$(_USER="${USER_NAME_HOST}"; eval echo "${_allpthtm1}" )
     fi
 
@@ -2071,7 +2107,11 @@ main() {
   SUBSYSTEM_FILES="ycimg sycimg ymount symount"
   #subsystem files includes this file
   SUBSYSTEM_FILES_ACL_CHMOD="750"
-  SUBSYSTEM_FILES_ACL_CHOWN="root:yocto-tools"
+  
+  #TODO: add yocto-tools group existence check during install phase
+  #sudo groupadd -g $GROUP_NUMBER $GROUP_NAME
+  SUBSYSTEM_FILES_YOCTO_TOOLS_GROUP_NAME="yocto-tools"
+  SUBSYSTEM_FILES_ACL_CHOWN="root:${SUBSYSTEM_FILES_YOCTO_TOOLS_GROUP_NAME}"
 
   #-rwr--r--
   SERVICE_FILES_ACL_CHMOD="644"

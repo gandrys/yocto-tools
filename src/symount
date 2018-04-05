@@ -2,8 +2,8 @@
 #====================================================================
 # NAME      :   ymount
 # AUTHOR    :   Andrys Jiri
-# DATE      :   2017.11.08
-# VERSION   :   0.2.5
+# DATE      :   2018.04.05
+# VERSION   :   0.2.6
 #
 # DEPENDENCIES:
 #               1) binaries: bash, grep, egrep, awk, mkdir, chmod, chown, 
@@ -682,12 +682,16 @@ mainbash () {
   #=GLOBAL_VARIABLES==========================================
 
   if [ "$operation" = "info" ]; then
-    echo -e "Used Loop Devices:"
+    echo -e "Used Loop Devices and Mounts:"
 
+    local _first_loopdev_num_hlp=$(( ${LOOPDEV_START_OFFSET} + (${USER_LOOPDEV_MAX} * (${logged_user_id_} - ${LOWEST_USER_ID} ))    ))
     get_usedloopdev_num "_usdloopdevs"
     for _uldevn in "${_usdloopdevs[@]}"; do
-      bla=$(sudo losetup -a | egrep "dev.*loop${_uldevn}:.*qemurawimg")
-      echo "  ${bla}"
+      _imgmountpoints=( $(mount | egrep "dev.*loop7p.*vd" | awk '{print $3}') )
+      _imgpath=$(sudo losetup -a | egrep "dev.*loop7:.*qemurawimg" | awk 'BEGIN{FS="[()]"} {print $2 }')
+      echo -e "  Loop Number    : ${_uldevn}"
+      echo -e "  Mounted Image  : ${_imgpath}"
+      echo -e "  Mount Points   : ${_imgmountpoints[@]}\n"
     done
     echo
     return 0;
