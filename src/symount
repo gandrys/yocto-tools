@@ -687,8 +687,8 @@ mainbash () {
     local _first_loopdev_num_hlp=$(( ${LOOPDEV_START_OFFSET} + (${USER_LOOPDEV_MAX} * (${logged_user_id_} - ${LOWEST_USER_ID} ))    ))
     get_usedloopdev_num "_usdloopdevs"
     for _uldevn in "${_usdloopdevs[@]}"; do
-      _imgmountpoints=( $(mount | egrep "dev.*loop7p.*vd" | awk '{print $3}') )
-      _imgpath=$(sudo losetup -a | egrep "dev.*loop7:.*qemurawimg" | awk 'BEGIN{FS="[()]"} {print $2 }')
+      _imgmountpoints=( $(mount | egrep "dev.*loop${_uldevn}p.*vd" | awk '{print $3}') )
+      _imgpath=$(sudo losetup -a | egrep "dev.*loop${_uldevn}:.*qemurawimg" | awk 'BEGIN{FS="[()]"} {print $2 }')
       echo -e "  Loop Number    : ${_uldevn}"
       echo -e "  Mounted Image  : ${_imgpath}"
       echo -e "  Mount Points   : ${_imgmountpoints[@]}\n"
