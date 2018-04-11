@@ -2,8 +2,8 @@
 #====================================================================
 # NAME      :   yocto
 # AUTHOR    :   Andrys Jiri
-# DATE      :   2018.04.05
-# VERSION   :   0.69
+# DATE      :   2018.04.11
+# VERSION   :   0.70
 #
 # DEPENDENCIES :
 #               Binaries: bash, grep, egrep, awk, mkdir, chmod, chown, 
@@ -337,8 +337,8 @@ docker_identify() {
         echo -e "  Error: Unable to start docker_user@${USER_NAME_HOST}.service "; return 1
       else
         echo -e "          : OK"
+        sleep 1
       fi
-      return 1;
     fi
     #}
   fi
