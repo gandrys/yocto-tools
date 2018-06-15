@@ -1,5 +1,4 @@
 # ===============================================================
-# NAME      :   ubuntu1604_yocto_base.v1.docker
 # AUTHOR    :   Andrys Jiri
 #
 # DEPENDENCIES:
@@ -12,10 +11,10 @@
 FROM ubuntu:16.04
 MAINTAINER Andrys Jiri "andrys.jiri+project_yocto_docker@gmail.com"
 
-LABEL Name="ubuntu1604_yocto_base.v1.docker" \
+LABEL Name="ubuntu1604_yocto_base.v2.docker" \
       Author="Andrys Jiri" \
-      Date="2018.01.09" \
-      Version="0.1" \
+      Date="2018.06.14" \
+      Version="0.2" \
       Description="Environment which includes basic dependencies for Yocto"
 
 
@@ -27,9 +26,9 @@ RUN apt-get install -y wget gawk git-core diffstat unzip texinfo gcc-multilib \
                        cpio
 #}
 
-#{In docker-ubuntu16.04 are missing sudo, python3, locale, packages 
+#{In docker-ubuntu16.04 are missing sudo, python3, locale, vim, packages 
 RUN apt-get install -y sudo ca-certificates pkg-config \
-    python3 python3-dev python3-pip language-pack-en-base && \
+    python3 python3-dev python3-pip language-pack-en-base vim && \
     apt-get upgrade -y  
 #}
 
