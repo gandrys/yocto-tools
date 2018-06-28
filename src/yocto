@@ -2,8 +2,8 @@
 #====================================================================
 # NAME      :   yocto
 # AUTHOR    :   Andrys Jiri
-# DATE      :   2018.06.14
-# VERSION   :   0.71
+# DATE      :   2018.06.27
+# VERSION   :   0.72
 #
 # DEPENDENCIES :
 #               Binaries: bash, grep, egrep, awk, mkdir, chmod, chown, 

@@ -11,10 +11,10 @@
 FROM ubuntu:14.04.5
 MAINTAINER Andrys Jiri "andrys.jiri+project_yocto_docker@gmail.com"
 
-LABEL Name="ubuntu14045_yocto_base.v5.docker" \
+LABEL Name="ubuntu14045_yocto_base.v6.docker" \
       Author="Andrys Jiri" \
-      Date="2017.12.21" \
-      Version="0.5" \
+      Date="2018.06.27" \
+      Version="0.6" \
       Description="Environment which includes basic dependencies for Yocto"
 
 
@@ -22,10 +22,23 @@ RUN apt-get update
 
 #{ Yocto dependencies
 RUN apt-get install -y python python-pip wget \
-                       gawk git-core diffstat unzip texinfo gcc-multilib \
+                       gawk diffstat unzip texinfo gcc-multilib \
                        build-essential chrpath socat gcc python nano curl \
                        xterm qemu-utils kpartx libsdl1.2-dev dos2unix language-pack-en-base
 #}
+
+#{ New git is necessary due to bug in credential-cache daemon
+#  The git credential-cache--daemon process wasn't closing stderr, so the Popen() function kept waiting to read from it....
+#  We use it for caching passwords during repo init and repo sync
+#  We can not use version of git in ubuntu ppa archive since it is not compatible with yocto ..(2.18..)
+
+RUN apt-get install -y make autoconf libcurl4-gnutls-dev gettext gcc zlib1g-dev
+RUN wget -O git.tar.gz https://github.com/git/git/archive/v2.7.5.tar.gz && \
+    tar -xzf git.tar.gz && cd git-* && make configure && ./configure --prefix=/usr --without-tcltk && \
+    make -j8 all && make install
+
+#}
+
 
 #{ Repo tool
 RUN curl http://commondatastorage.googleapis.com/git-repo-downloads/repo >/usr/local/bin/repo && \
