@@ -3,7 +3,7 @@
 # NAME      :   yocto
 # AUTHOR    :   Andrys Jiri
 # DATE      :   2018.07.09
-VERSION='0.73'
+VERSION='0.74'
 #
 # DEPENDENCIES :
 #               Binaries: bash, grep, egrep, awk, mkdir, chmod, chown, 
@@ -135,9 +135,8 @@ tool_getver() {
   
   _new_ver=$( wget -qO - "${_LINK_TO_VERSION}" | awk 'FNR<7{mstr="VERSION";if(match($0,mstr)!=0){yverline=$0;gsub(/[^0-9.]/,"",yverline);if(yverline==yverline+1-1){print yverline; exit 0}else{exit 1}  }}'   )
   errlev=$?;
-
-  #echo $errlev
-  #echo $_new_ver
+  
+  [ "x${_new_ver}" == "x" ] && errlev='1'
  
   eval ${_ret}="${_new_ver}"
   return "${errlev}"
@@ -229,8 +228,6 @@ try2update() {
     return 0
   fi
   
-  echo -e "\nChecking latest version:"
-  
   tool_getver web_version
   ret=$?
   yn="n"
@@ -254,7 +251,6 @@ try2update() {
     return 0;
   fi
   
-    
   #if user have right we can ask 
   echo -e "         Do you want to install new yocto-tools? [y/n]"
   read -p "         >" yn
