@@ -230,9 +230,9 @@ try2update() {
   
   tool_getver web_version
   ret=$?
-  yn="n"
+
   if [ "${ret}" != "0" ]; then  
-    echo -e "  Warning: Unable to check on-line version.\n"
+    echo -e "  Warning: Unable to check version.\n"
     return 1
   fi
   
@@ -250,7 +250,8 @@ try2update() {
   if [ ! ${_ret} -eq 0 ]; then
     return 0;
   fi
-  
+
+  yn="n"
   #if user have right we can ask 
   echo -e "         Do you want to install new yocto-tools? [y/n]"
   read -p "         >" yn
