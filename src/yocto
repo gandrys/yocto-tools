@@ -2,8 +2,8 @@
 #====================================================================
 # NAME      :   yocto
 # AUTHOR    :   Andrys Jiri
-# DATE      :   2018.06.27
-# VERSION   :   0.72
+# DATE      :   2018.07.09
+VERSION='0.73'
 #
 # DEPENDENCIES :
 #               Binaries: bash, grep, egrep, awk, mkdir, chmod, chown, 
@@ -33,16 +33,107 @@
 #
 #
 #====================================================================
+getdockerfilelastver() {
+  local _dir=$1
+  local _basefname=$2
+  local _ret=$3
+  
+  _lastversion="$(find ${_dir} -name "${_basefname}"".v*.docker" | sort -u | awk -v basename=${_basefname} -v fdir=${_dir} 'END{ lstl=$0; 
+  if(length(lstl)>1){ 
+    sub("./","",lstl);ss=substr(lstl,length(fdir)+length(basename)+2);gsub(/[^0-9 ]/,"",ss); print ss  
+  }else{
+    print ""
+  } }')"
+  
+  eval ${_ret}="${_lastversion}"
 
+}
+
+dfiles_check() {
+  
+  local _data_src_file=$1
+  
+  declare -a _arr_data_fles
+  declare -a _eval_datafles
+
+  #extraction of file names and paths
+  data_fles=$(awk 'BEGIN { data_part = 0; name_only=0 }{
+    ##names only
+    if(data_part&&name_only){
+      print $0
+      name_only=0
+    };
+    if(($0 == "BASE64_DATA_FILES:")||(data_part>0 && $0 == "" )){
+      data_part+=1;
+      name_only=1;
+    };
+  }' "/usr/local/bin/${_data_src_file}")
+  _arr_data_fles=( ${data_fles} )
+
+  
+  #file paths in data_fles varibles have variables insides ...eval $user
+  for fle in ${_arr_data_fles[@]}; do
+    #'/home/$USER_NAME_HOST/.config/yocto_docker/build_0.1/ubuntu1604_yocto_user.v3.docker'
+    #/home/jiri/.config/yocto_docker/build_0.1/ubuntu14045_yocto_base.v6.docker
+    _expfle="$(eval echo "${fle}")"
+    
+    #ubuntu14045_yocto_base.v6.docker
+    _flename="${_expfle##*/}" 
+    [[ ${_flename} != *".v"*".docker" ]] && continue
+    
+    #ubuntu14045_yocto_base
+    _namenover="${_flename%%.*}"
+    
+    #v6.docker
+    fsufix="${_flename/$_namenover/}"
+    yfile_vernum="${fsufix//[!0-9]/}"
+    
+    
+    #/home/jiri/.config/yocto_docker/build_0.1
+    _fledir="${_expfle%/*}"
+    
+    #we could just check existence of the same version installed ..but user can change it and update itself, 
+    #so we check if yocto file includes newer if yes then update ->return 1
+    getdockerfilelastver "${_fledir}" "${_namenover}" instfle_vernum
+    
+    if [ "x${instfle_vernum}" == "x" ]; then
+      #if any file is not found then update ...
+      return 1;
+    fi
+    
+    if [ "${yfile_vernum}" -gt "${instfle_vernum}" ]; then
+      return 2;
+    fi
+    
+  done
+  
+  #all files in yocto file(base64fles) we found installed in user's directory and have 
+  return 0;
+  
+}
 tool_getver() {
   local _ret=$1
-  local _LINK_TO_VERSION='https://raw.github.com/gandrys/yocto-tools/master/sources/version'
+  local _LINK_TO_VERSION='https://raw.github.com/gandrys/yocto-tools/master/src/yocto'
 
   #local _LINK_TO_VERSION='https://raw.github.com/gandrys/trabla/master/src/bobek.b'
   #wget in case of no error return 0,
   #we have not to have local modificator in this case because retval value is gonna dissapear
 
-  _new_ver=$( wget -qO - "${_LINK_TO_VERSION}" )
+  #parse yocto file in src folder
+  #version have to be valid number 
+  #  >this is ok 0.72, 
+  #  > this is not ok 0.7.2> 
+  #{
+  # #!/bin/bash
+  #====================================================================
+  # NAME      :   yocto
+  # AUTHOR    :   Andrys Jiri
+  # DATE      :   2018.06.27
+  # VERSION=0.72
+  #
+  #}
+  
+  _new_ver=$( wget -qO - "${_LINK_TO_VERSION}" | awk 'FNR<7{mstr="VERSION";if(match($0,mstr)!=0){yverline=$0;gsub(/[^0-9.]/,"",yverline);if(yverline==yverline+1-1){print yverline; exit 0}else{exit 1}  }}'   )
   errlev=$?;
 
   #echo $errlev
@@ -96,11 +187,12 @@ cmpver() {
 yocto_tools_update() {
   local _update_dir=$1
   local _LINK_TO_UPDATE="https://github.com/gandrys/yocto-tools.git"
-  echo -e "\n  Updating: \n"
+  
+  echo -e "\nUpdating: \n"
   
   mkdir -p "${_update_dir}"
   
-  local _bla=$(git clone "${_LINK_TO_UPDATE}" -C "${_update_dir}" )
+  local _bla=$(git clone "${_LINK_TO_UPDATE}" "${_update_dir}" )
   local _ret=$?
   if [ "${_ret}" != "0" ]; then 
     echo -e "  Error: git clone ${_LINK_TO_UPDATE} -C ${_update_dir} "
@@ -108,7 +200,7 @@ yocto_tools_update() {
   fi
   
   yn="n"
-  echo -e "  \nInfo: Do you want to install docker services to support multi-user environment ? [y/n]"
+  echo -e "  \nInfo: Do you want to install multi-user environment ? [y/n]"
   read -p "        >" yn
   if [ "$yn" == "y" ]; then 
     "${_update_dir}/yocto" install --install-subsystem-files --install-services
@@ -118,12 +210,21 @@ yocto_tools_update() {
 
 }
 
+isusermember() {
+  local _grpname=$1
+  
+  local _um=( $(id -nG) );
+  
+  for el in ${_um[@]}; do [ "$el" == "${_grpname}" ] && return 0 ; done
+  
+  return 1;
+}
 
 try2update() {
 
-
-  if [ "$(date +%u)" != "3" ]; then 
-    return 1
+  #check every monday
+  if [ "$(date +%u)" != "1" ]; then 
+    return 0
   fi
   
   echo -e "\nChecking latest version:"
@@ -138,31 +239,40 @@ try2update() {
   
   cmpver "${VERSION}" "${web_version}"
   ret=$?
-  if [ "${ret}" -eq "1" ]; then 
-     echo -e "\nWarning: New version of yocto-tools is available."
-     echo -e "         Do you want to install new yocto-tools, version ${new_version} [y/n]"
-     read -p "         >" yn
+  if [ ! "${ret}" -eq "1" ]; then
+    return 0;
+  fi
+
+  echo -e "\nWarning: New version ${web_version} is available."
+  
+  #check if user can install yoto-tools ...user have to have sudo rights
+  isusermember 'sudo' 
+  _ret=$?
+  if [ ! ${_ret} -eq 0 ]; then
+    return 0;
   fi
   
+    
+  #if user have right we can ask 
+  echo -e "         Do you want to install new yocto-tools? [y/n]"
+  read -p "         >" yn
+         
   if [ "${yn}" == "y" ]; then  
-    UPDATE_DIRECTORY="${YOCTO_DOCKER_CONFIG_DIR}/update_${new_version}" ]
+    UPDATE_DIRECTORY="${YOCTO_DOCKER_CONFIG_DIR}/update_${web_version}" 
     
     yocto_tools_update "${UPDATE_DIRECTORY}"
     
     for up_dir in "${YOCTO_DOCKER_CONFIG_DIR}/update_"*; do
-     [ "${up_dir##*_}" == "${new_version}"* ] && continue
-     
-     #no one wanna delete whole drive .... 
-     if [[ "${up_dir}" == *"yocto_docker"* ]]; then
-      rm -rf "${up_dir}"
-     fi
+      [ "${up_dir##*_}" == "${web_version}"* ] && continue
+      #no one wanna delete whole drive .... 
+      if [[ "${up_dir}" == *"yocto_docker"* ]]; then
+        rm -rf "${up_dir}"
+      fi
     done
-    
     exit 0
   fi
-
+         
 }
-
 
 
 
@@ -890,7 +1000,7 @@ update_script_data2() {
   return 0;
 }
 
-#Recreate files in base64 format from data in the end of yocto script.
+#Recreate files in base64 format from data at the end of yocto script.
 #Not all files in list have to be re-created in case of SKIP: in data then file is skiped
 recreate_file() {
   local _filesinstorage=$1
@@ -926,7 +1036,7 @@ recreate_file() {
   
 }
 
-#Recreate files in base64 format from data in the end of yocto script.
+#Recreate files in base64 format from data at the end of yocto script.
 #Not all files in list have to be re-created in case of SKIP: in data then file is skiped
 recreate_files() {
   local _files=$1
@@ -980,7 +1090,7 @@ recreate_files() {
 
 
 #Crazily slow in case of big files 10 min was not enough for cca 300MB base64 file
-#Recreate files in base64 format from data in the end of yocto script.
+#Recreate files in base64 format from data at the end of yocto script.
 #and return list(string with spaces) of all base64 files
 recreate_files2() {
 
@@ -1003,7 +1113,13 @@ recreate_files2() {
       return 1
     fi
   fi
-
+  
+  #auto update docker files 
+  #in case uf multi-user install ...and only docker-files update
+  if [ ! -e "${_data_src_file}" ]; then
+    _data_src_file="/usr/local/bin/${_data_src_file}"
+  fi
+  
   #extraction of file names and paths
   data_fles=$(awk 'BEGIN { data_part = 0; name_only=0 }{
     ##names only
@@ -1093,6 +1209,9 @@ recreate_files2() {
 }
 
 
+#searching in list of base64 data files(file names),
+# if in list only yocto_base*.docker > search in local fldr related archive files and cpy them to tmp_inst_dir
+#  > rewrite the one in users"s folder by one in local folder
 cp_docker_archives_to_usr_dir(){
   local _data_files=$1
   declare -a _arr_data_files=( ${_data_files} )
@@ -1115,10 +1234,19 @@ cp_docker_archives_to_usr_dir(){
       continue
     fi
 
-    echo -e "    >Find file in local folder:"
+    echo -e "    >Searching file in current  folder:"
     if [ -e "${fnameonly}.tar.bz2" ]; then
       echo -e "      >Found, copying to ${_tmp_inst_dir} directory. "
       cp -f "${fnameonly}.tar.bz2" "${_tmp_inst_dir}""/"
+      continue
+    else
+      echo -e "      >Not Found"
+    fi
+    
+    echo -e "    >Searching file in /usr/local/bin  folder:"
+    if [ -e "/usr/local/bin/${fnameonly}.tar.bz2" ]; then
+      echo -e "      >Found, copying to ${_tmp_inst_dir} directory. "
+      cp -f "/usr/local/bin/${fnameonly}.tar.bz2" "${_tmp_inst_dir}""/"
     else
       echo -e "      >Not Found"
     fi
@@ -1247,6 +1375,8 @@ set_sudoers() {
   fi
 }
 
+
+#TODO:Later on rewrite this messy function ...
 install_files() {
   local _files=$1
   declare -a _instfiles
@@ -1403,6 +1533,18 @@ install_files() {
       [ "${_tmp_skip}" == "true" ] && continue
     fi
     
+    
+    # --update-docker-files-only
+    # multi-user intallation only, in this case user is not member of sudo group, 
+    # so we should not call sudo ... 
+    if [ "${INSTALL_UPDATE_DOCKER_FILES_ONLY}" == "yes" ]; then
+      sudo=""
+      if [ "${fle##*/}" == "umess.sh" ]; then
+          continue
+      fi
+    fi
+    
+    
     echo -e "  ""$fle"
 
     #check if file exist in given destination
@@ -1506,6 +1648,13 @@ install_files() {
     fi
   done
   #}
+  
+    
+  # --update-docker-files-only
+  if [ "${INSTALL_UPDATE_DOCKER_FILES_ONLY}" == "yes" ]; then
+      return 0
+  fi
+  
   
   if [ "${OS_STRING}" != "NATIVE_LINUX" ]; then
     echo -e " \n\n !! PLEASE CLOSE/TERMINATE TERMINAL AND CONTINUE IN NEW ONE !! \n\n"
@@ -1821,6 +1970,14 @@ echo -e "\
   |
   | ->In case of multi-user environment(buildmachine, linux), add new user:
   |   $ yocto install --install-services
+  |  
+  | ->In case of multi-user environment(buildmachine, linux), updates only docker files:
+  |   In case of multi-user environment,
+  |   Administrator install latest version of yocto-tools, 
+  |   but docker-files and related pre-builded archives of base-docker files located in home folder are not updated.
+  |   In order to updated also mentioned files, this function is called automatically when user's docker-files are old.
+  |   $ yocto install --update-docker-files-only
+  |
 
   COMMAND: cimg
   | ->Run ycimg tool and create image for storing yocto environment
@@ -1852,10 +2009,6 @@ echo -e "\
   | ->OPTION: --restart
   |   Restart virtual machine
   |   Available only in Windows.
-
-  COMMAND: update
-  |  Check current and aviable versions and install tools.
-  |  Not implemented.
   
   COMMAND: { cdbimg | cdbimg="DOCKER_FILE" }
   |  >Create docker base image. Yocto tool is composed from two docker images in order to speed up entirely process.
@@ -1876,6 +2029,8 @@ echo -e "\
   COMMAND: { release | release="DIRECTORY_OF_UPDATED_FILES" }
   |--OPTIONS: {--add-base-image}
 
+  COMMAND: { version }
+  
 "
 }
 
@@ -2035,9 +2190,6 @@ main() {
     export sudo
   fi
   
-  
-  VERSION="0.1"
-  
   fname=$(basename $0)
   release_fname="../release/${fname}"
   
@@ -2046,6 +2198,7 @@ main() {
   ADD_BASE_IMAGE="no"
   INSTALL_SUBSYSTEM_FILES="no"
   INSTALL_SERVICES="no"
+  INSTALL_UPDATE_DOCKER_FILES_ONLY="no"
   RESTART_DOCKER_MACHINE="no"
 
   DOCKER_USER_DOCKER_IMAGES_STORAGE_SIZE_GB="10"
@@ -2064,15 +2217,15 @@ main() {
   YOCTO_DOCKER_CONFIG_DIR="/home/$USER_NAME_HOST/.config/yocto_docker"
   DOCKER_USER_CONFIG_DIR="/home/$USER_NAME_HOST/.config/docker_user"
 
-  TEMP_INSTALLATION_DIRECTORY="${YOCTO_DOCKER_CONFIG_DIR}/tmp_yocto_inst_${VERSION}"
-  DOCKER_BUILD_DIRECTORY="${YOCTO_DOCKER_CONFIG_DIR}/build_${VERSION}"
+  TEMP_INSTALLATION_DIRECTORY="${YOCTO_DOCKER_CONFIG_DIR}/tmp_yocto_inst"
+  DOCKER_BUILD_DIRECTORY="${YOCTO_DOCKER_CONFIG_DIR}/build"
 
 #{paths in base64 files, used during update command
   BASE64_DATA_YOCTO_DOCKER_CONFIG_DIR="/home/\$USER_NAME_HOST/.config/yocto_docker"
   BASE64_DATA_DOCKER_USER_CONFIG_DIR="/home/\$USER_NAME_HOST/.config/docker_user"
 
-  BASE64_DATA_TEMP_INSTALLATION_DIRECTORY="${BASE64_DATA_YOCTO_DOCKER_CONFIG_DIR}/tmp_yocto_inst_${VERSION}"
-  BASE64_DATA_DOCKER_BUILD_DIRECTORY="${BASE64_DATA_YOCTO_DOCKER_CONFIG_DIR}/build_${VERSION}"
+  BASE64_DATA_TEMP_INSTALLATION_DIRECTORY="${BASE64_DATA_YOCTO_DOCKER_CONFIG_DIR}/tmp_yocto_inst"
+  BASE64_DATA_DOCKER_BUILD_DIRECTORY="${BASE64_DATA_YOCTO_DOCKER_CONFIG_DIR}/build"
 #}
 
   DOCKER_USER_BUILMACHINE_TEMPLATE_CONFIG_FNAME="docker_user_default"
@@ -2258,6 +2411,10 @@ main() {
         INSTALL_SERVICES="yes"
       ;;
       
+      --update-docker-files-only)
+        INSTALL_UPDATE_DOCKER_FILES_ONLY="yes"
+      ;;
+      
       --restart)
         RESTART_DOCKER_MACHINE="yes"
       ;;
@@ -2268,8 +2425,13 @@ main() {
         #user selected docker_user file by parameter>
           prep_yocto_user_docker_file="${arg#*=}"
         fi
-
       ;;
+      
+            
+      version)
+        operation="version"
+      ;;
+      
       
     esac
   done
@@ -2304,7 +2466,22 @@ main() {
       cygwin_vbox_create_docker_machine
     fi
   
-    ##try2update
+  
+    #if dockerfile ver in current yocto file(base64fles) > files in home inst files  
+    dfiles_check ${fname}
+    _ret=$?
+    if [ ! "${_ret}" -eq 0 ]; then
+      yn="y"
+      echo -e "\nDocker-files Check:\n  Do you want to install latest docker-files? [y/n]"
+      read -e  -p "  >" yn
+      if [ "$yn" == "y" ]; then
+         echo -e "\n"
+        /usr/local/bin/yocto install --update-docker-files-only 
+        exit $?
+      fi
+    fi
+    try2update
+    
   fi
   #========================================================================================== 
   
@@ -2424,6 +2601,9 @@ main() {
     ymount umount
   elif [ "$operation" == "ymount_info" ]; then
     ymount info
+    
+  elif [ "$operation" == "version" ]; then
+    echo  -e "\nYocto-tools version: ${VERSION}"
   fi
   
   echo -e "\n"

@@ -134,7 +134,7 @@ and we can remove given user from sudo group.
 4. In case of windows OS please install cygwin and git, curl and awk package, 
 then in cygwin shell just call :  
 >`$ ./yocto install `  
-  The rest of tools such as docker will be installed by from "chocolatey repository"
+  The rest of tools such as docker will be installed from "chocolatey repository"
 
 Note.: 
    Characters "./" are important, please do not skip them during installation.

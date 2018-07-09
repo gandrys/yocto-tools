@@ -160,6 +160,7 @@ for arg in "$@"; do
     mount|mount=*|--mount|--mount=*|-m=*)
       operation="mount"
       path_to_img_file="${arg#*=}"
+      [ "${arg#*=}" == "mount" ] && path_to_img_file=""
     ;;
     --no-opt-mount|--no-opt|-n)
       skip_opt_mount="y"
