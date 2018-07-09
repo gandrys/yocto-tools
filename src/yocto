@@ -3,7 +3,7 @@
 # NAME      :   yocto
 # AUTHOR    :   Andrys Jiri
 # DATE      :   2018.07.09
-VERSION='0.74'
+VERSION='0.75'
 #
 # DEPENDENCIES :
 #               Binaries: bash, grep, egrep, awk, mkdir, chmod, chown, 
@@ -1451,7 +1451,7 @@ install_files() {
 
   fi
 
-  if [  ! -e "${fname}" ] && [ -e "${INSTALL_SOURCE_FILE}" ]; then
+  if [ -e "${INSTALL_SOURCE_FILE}" ]; then
     recreate_files2 "${INSTALL_SOURCE_FILE}" "${_tmp_install_dir}" base64fles
   else
     recreate_files2 "${fname}" "${_tmp_install_dir}" base64fles
@@ -1484,7 +1484,7 @@ install_files() {
     #Add this script to installation files:
     
     #in case of autoupdate we have to copy it from cloned folder 
-    if [  ! -e "${fname}" ] && [ -e "${INSTALL_SOURCE_FILE}" ]; then
+    if [ -e "${INSTALL_SOURCE_FILE}" ]; then
       cp -f "${INSTALL_SOURCE_FILE}" "${_tmp_install_dir}/${fname}"
     else
       cp -f "${fname}" "${_tmp_install_dir}/${fname}"
