@@ -203,9 +203,9 @@ yocto_tools_update() {
   echo -e "  \nInfo: Do you want to install multi-user environment ? [y/n]"
   read -p "        >" yn
   if [ "$yn" == "y" ]; then 
-    "${_update_dir}/yocto" install --install-subsystem-files --install-services
+    "${_update_dir}/release/yocto" install --install-subsystem-files --install-services
   else
-    "${_update_dir}/yocto" install --install-subsystem-files
+    "${_update_dir}/release/yocto" install --install-subsystem-files
   fi
 
 }
