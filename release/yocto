@@ -205,9 +205,9 @@ yocto_tools_update() {
   echo -e "  \nInfo: Do you want to install multi-user environment ? [y/n]"
   read -p "        >" yn
   if [ "$yn" == "y" ]; then 
-    "${_update_dir}/release/yocto" install --install-subsystem-files --install-services
+    "${_update_dir}/release/yocto" install --install-subsystem-files --install-services --source-file="${_update_dir}/release/yocto"
   else
-    "${_update_dir}/release/yocto" install --install-subsystem-files
+    "${_update_dir}/release/yocto" install --install-subsystem-files --source-file="${_update_dir}/release/yocto"
   fi
 
 }
@@ -1454,7 +1454,11 @@ install_files() {
 
   fi
 
-  recreate_files2 "${fname}" "${_tmp_install_dir}" base64fles
+  if [  ! -e "${fname}" ] && [ -e "${INSTALL_SOURCE_FILE}" ]; then
+    recreate_files2 "${INSTALL_SOURCE_FILE}" "${_tmp_install_dir}" base64fles
+  else
+    recreate_files2 "${fname}" "${_tmp_install_dir}" base64fles
+  fi
 
   retval=$?
   if [ "$retval" == "0" ]; then
@@ -1470,6 +1474,9 @@ install_files() {
   #{ Copy Files
   echo -e "\nCopying Files:"
 
+  #auto-update function we need to know where is file to run
+  #/.config/yocto_docker/update_XX/release/yocto ...
+  
   #3)in case of standalone Windows PC installation:
   if [ "${OS_STRING}" != "NATIVE_LINUX" ]; then
     cp -f "${fname}" "${_tmp_install_dir}/${fname}"
@@ -1478,7 +1485,13 @@ install_files() {
 
   if [ "${INSTALL_SUBSYSTEM_FILES}" == "yes" ]; then
     #Add this script to installation files:
-    cp -f "${fname}" "${_tmp_install_dir}/${fname}"
+    
+    #in case of autoupdate we have to copy it from cloned folder 
+    if [  ! -e "${fname}" ] && [ -e "${INSTALL_SOURCE_FILE}" ]; then
+      cp -f "${INSTALL_SOURCE_FILE}" "${_tmp_install_dir}/${fname}"
+    else
+      cp -f "${fname}" "${_tmp_install_dir}/${fname}"
+    fi
     _instfiles=( "/usr/local/bin/${fname}" ${_instfiles[@]} )
   fi
 
@@ -1951,7 +1964,7 @@ echo -e "\
   Usage:  yocto COMMAND OPTIONS
                 
   COMMAND: install
-  |--OPTIONS: --install-subsystem-files, --install-services
+  |--OPTIONS: --install-subsystem-files, --install-services, --source-file=RELEASE_FILE
   |
   |  >Only in case of install command we have to run "yocto" command in directory of executable
   |  >Copy and set up tools/evironment in directories:
@@ -2421,14 +2434,18 @@ main() {
         RESTART_DOCKER_MACHINE="yes"
       ;;
       
+      
       --custom-img|--custom-img=*|-c=*|-c)
-
         if [ ! "$arg" == "--custom-img" ] && [ ! "$arg" == "-c" ]; then
         #user selected docker_user file by parameter>
           prep_yocto_user_docker_file="${arg#*=}"
         fi
       ;;
       
+      
+      --source-file=*)
+        INSTALL_SOURCE_FILE="${arg#*=}"
+      ;;
             
       version)
         operation="version"
