@@ -199,6 +199,8 @@ yocto_tools_update() {
     exit 1 
   fi
   
+  chmod +x "${_update_dir}/release/yocto"
+  
   yn="n"
   echo -e "  \nInfo: Do you want to install multi-user environment ? [y/n]"
   read -p "        >" yn
