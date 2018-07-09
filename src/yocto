@@ -192,10 +192,10 @@ yocto_tools_update() {
   
   mkdir -p "${_update_dir}"
   
-  local _bla=$(git clone "${_LINK_TO_UPDATE}" "${_update_dir}" )
-  local _ret=$?
+  _bla=$(git clone "${_LINK_TO_UPDATE}" "${_update_dir}" )
+  _ret=$?
   if [ "${_ret}" != "0" ]; then 
-    echo -e "  Error: git clone ${_LINK_TO_UPDATE} -C ${_update_dir} "
+    echo -e "  Error: git clone ${_LINK_TO_UPDATE} ${_update_dir} "
     exit 1 
   fi
   
