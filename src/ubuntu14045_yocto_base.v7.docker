@@ -11,10 +11,10 @@
 FROM ubuntu:14.04.5
 MAINTAINER Andrys Jiri "andrys.jiri+project_yocto_docker@gmail.com"
 
-LABEL Name="ubuntu14045_yocto_base.v6.docker" \
+LABEL Name="ubuntu14045_yocto_base.v7.docker" \
       Author="Andrys Jiri" \
-      Date="2018.06.27" \
-      Version="0.6" \
+      Date="2018.11.07" \
+      Version="0.7" \
       Description="Environment which includes basic dependencies for Yocto"
 
 
@@ -39,7 +39,11 @@ RUN wget -O git.tar.gz https://github.com/git/git/archive/v2.7.5.tar.gz && \
 
 #}
 
+#vim includes tool for exporting hex data which is sometimes in makefiles
+#dwarfdump is tool used for additional dumping of ELF data which is sometimes in makefiles 
+RUN apt-get install -y vim dwarfdump
 
 #{ Repo tool
 RUN curl http://commondatastorage.googleapis.com/git-repo-downloads/repo >/usr/local/bin/repo && \
     chmod a+rwx /usr/local/bin/repo 
+

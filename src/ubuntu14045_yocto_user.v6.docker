@@ -8,13 +8,13 @@
 #             Yocto docker file.
 # 
 # ==============================================================
-FROM gandrys/ubuntu14045_yocto_base:v6
+FROM gandrys/ubuntu14045_yocto_base:v7
 MAINTAINER Andrys Jiri "andrys.jiri+project_yocto_docker@gmail.com"
 
-LABEL Name="ubuntu14045_yocto_user.v5.docker" \
+LABEL Name="ubuntu14045_yocto_user.v6.docker" \
       Author="Andrys Jiri" \
-      Date="2018.06.27" \
-      Version="0.5" \
+      Date="2018.11.07" \
+      Version="0.6" \
       Description="Yocto-user docker file"
 
 

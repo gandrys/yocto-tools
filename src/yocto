@@ -2,8 +2,8 @@
 #====================================================================
 # NAME      :   yocto
 # AUTHOR    :   Andrys Jiri
-# DATE      :   2018.07.09
-VERSION='0.75'
+# DATE      :   2018.11.08
+VERSION='0.76'
 #
 # DEPENDENCIES :
 #               Binaries: bash, grep, egrep, awk, mkdir, chmod, chown, 
@@ -2488,11 +2488,15 @@ main() {
     _ret=$?
     if [ ! "${_ret}" -eq 0 ]; then
       yn="y"
-      echo -e "\nDocker-files Check:\n  Do you want to install latest docker-files? [y/n]"
+      echo -e "New docker-files available:\n  Do you want to install latest docker-files? [y/n]"
       read -e  -p "  >" yn
       if [ "$yn" == "y" ]; then
          echo -e "\n"
-        /usr/local/bin/yocto install --update-docker-files-only 
+         #This is used mostly on BuildMachines where admin install only last version and user update only docker files.
+         #By default install cmd takes src file as file from current directory,
+         #but in this time we have already installed "yocto-file" in standard location("/usr/local/bin/yocto")
+         #so this file will be source of our new data.
+        /usr/local/bin/yocto install --update-docker-files-only --source-file="/usr/local/bin/yocto" 
         exit $?
       fi
     fi

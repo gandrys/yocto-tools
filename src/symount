@@ -2,8 +2,8 @@
 #====================================================================
 # NAME      :   ymount
 # AUTHOR    :   Andrys Jiri
-# DATE      :   2018.04.05
-# VERSION   :   0.2.6
+# DATE      :   2018.11.08
+# VERSION   :   0.2.7
 #
 # DEPENDENCIES:
 #               1) binaries: bash, grep, egrep, awk, mkdir, chmod, chown, 
@@ -745,7 +745,9 @@ mainbash () {
             get_loopdevnum "${mount_point_id}" "_freeloopdev_num_"
             ret=$?
             if [ ! "$ret" -eq 0 ]; then 
-              echo -e "\n Error: Given mount-point-id is occupied, no free loop devices ! Exiting"; 
+              echo -e "\n Error: Given mount-point-id is occupied, no free loop devices !";
+              echo -e "        Please read documentation and check hardwired constants: LOOPDEV_START_OFFSET, USER_LOOPDEV_MAX  !";
+              echo -e "        Exiting ! "
               mnt_stat_=${ret}
             else
               mount_rawimg "${_freeloopdev_num_}" "${skip_opt_mount}" "${check_img_dirs}" "cur_mnt_points"

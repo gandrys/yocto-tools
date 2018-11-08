@@ -2,8 +2,8 @@
 #====================================================================
 # NAME      :   ymount
 # AUTHOR    :   Andrys Jiri
-# DATE      :   2017.11.08
-# VERSION   :   0.2.5
+# DATE      :   2018.11.08
+# VERSION   :   0.2.7
 #
 # DEPENDENCIES:
 #               1) binaries: bash, grep, egrep, awk, mkdir, chmod, chown, 

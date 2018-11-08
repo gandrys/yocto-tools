@@ -11,10 +11,10 @@
 FROM ubuntu:16.04
 MAINTAINER Andrys Jiri "andrys.jiri+project_yocto_docker@gmail.com"
 
-LABEL Name="ubuntu1604_yocto_base.v2.docker" \
+LABEL Name="ubuntu1604_yocto_base.v3.docker" \
       Author="Andrys Jiri" \
-      Date="2018.06.14" \
-      Version="0.2" \
+      Date="2018.11.07" \
+      Version="0.3" \
       Description="Environment which includes basic dependencies for Yocto"
 
 
@@ -27,6 +27,7 @@ RUN apt-get install -y wget gawk git-core diffstat unzip texinfo gcc-multilib \
 #}
 
 #{In docker-ubuntu16.04 are missing sudo, python3, locale, vim, packages 
+#vim includes tool for exporting hex data which is sometimes in makefiles
 RUN apt-get install -y sudo ca-certificates pkg-config \
     python3 python3-dev python3-pip language-pack-en-base vim && \
     apt-get upgrade -y  
@@ -42,10 +43,11 @@ RUN apt-get install -y nano
 #Some layers from are using really often following tools 
 RUN apt-get install -y dos2unix
 
-
 #Tools for yocto-tools
 RUN apt-get install -y kpartx qemu-utils 
 
+#dwarfdump is tool used for additional dumping of ELF data which is sometimes in makefiles
+RUN apt-get install -y dwarfdump
 
 #Cleaning 
 RUN apt-get autoremove -y && \

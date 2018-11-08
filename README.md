@@ -1,5 +1,5 @@
 
-# *yocto-tools [Andrys Jiri, 2018.03.26]*  
+# *yocto-tools [Andrys Jiri, 2018.11.08, v0.76 ]*  
 
  Author        : Jiri Andrys  
  Maintainer    : Jiri Andrys  
@@ -102,13 +102,17 @@ Yocto-tools has been tested on following systems:
 
 ## 3.1 Installation
 
-Yocto-tools can be installed two different ways.
-First is single-user mode, which will not install any systemd services.
-Second is multi-user mode/buildmachine mode which will install docker-user services,
+**Released yocto-tools are located in "release" directory,
+use this "release/yocto" file for any installation, the "src" directory
+is only for making releases, it is only for developers.**
+
+Yocto-tools can be installed two different ways.   
+First is single-user mode, which will not install any systemd services.   
+Second is multi-user mode/buildmachine mode which will install docker-user services,  
 where every user will have own dockerd deamon.
 
 Because of yocto-tools during installation copy files to system folders,  
-given user have to be member of sudo group. 
+given user have to be member of sudo group.   
 Once tools are installed yocto-tools modify sudoerr file
 and limit user only to yocto-tools, 
 then general privileged rights(being member of sudo group) are not necessary
