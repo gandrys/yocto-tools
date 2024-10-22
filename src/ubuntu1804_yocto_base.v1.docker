@@ -1,0 +1,93 @@
+# ===============================================================
+# AUTHOR    :   Andrys Jiri
+#
+# DEPENDENCIES:
+#               1) Binaries: Ubuntu 18.04
+#
+# DESCRIPTION:
+#             Docker file for Yocto
+# 
+# ==============================================================
+FROM ubuntu:18.04
+
+LABEL Name="ubuntu1804_yocto_base.v1.docker" \
+      Author="Andrys Jiri" \
+      Maintainers="Andrys Jiri, andrys.jiri+project_yocto_docker@gmail.com" \
+      Date="2024.10.18" \
+      Version="0.1" \
+      Description="Environment which includes basic dependencies for Yocto" \
+      TestedRuntimeEnv="ubuntu22.04, wsl2:ubuntu22.04" \
+      TestedYocto="zeus" \
+      SupportedYocto="zeus, dunfell, kirkstone" \
+      YoctoCompatibility=" Please take a look to: https://git.yoctoproject.org/poky/tree/meta-poky/conf/distro/poky.conf?h=zeus"
+
+
+RUN apt-get update
+
+#{Timezone set, without it install will hang due to text question dialog during install
+# TZ=Etc/UTC = "Universal Time" + 0 => ~ GMT+0
+RUN DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get -y install tzdata
+#}
+
+
+#{ Yocto dependencies
+RUN apt-get install -y gawk wget git diffstat unzip texinfo gcc-multilib \
+                       build-essential chrpath socat cpio gcc \
+                       python python3 python3-pip python3-pexpect \
+                       xz-utils debianutils iputils-ping python3-git python3-jinja2 libegl1-mesa libsdl1.2-dev \
+                       pylint3 xterm curl \
+                       python3-subunit mesa-common-dev \
+                       zstd liblz4-tool file locales libacl1
+#}
+
+#{ Yocto dependencies
+RUN locale-gen en_US.UTF-8
+#}
+
+#{ Kas tool is often used
+RUN pip3 install kas
+#}
+
+#{ Usefull: bash_completion
+RUN apt-get install -y bash-completion
+#Enable:
+RUN sed -i '$ a\shopt -oq posix || . /usr/share/bash-completion/bash_completion' /etc/bash.bashrc
+#}
+
+#{In docker-ubuntu18.04 are missing sudo, python3, locale, vim, packages
+#vim includes tool for exporting hex data which is sometimes in makefiles
+RUN apt-get install -y sudo ca-certificates pkg-config \
+    python3-dev language-pack-en-base vim && \
+    apt-get upgrade -y  
+#}
+
+#{Dependency given by NXP meta-layers 
+RUN apt-get install -y u-boot-tools
+#}
+
+#Tools for make things easier 
+RUN apt-get install -y nano 
+
+#Some layers from are using really often following tools 
+RUN apt-get install -y dos2unix
+
+#Tools for yocto-tools
+RUN apt-get install -y kpartx qemu-utils 
+
+#dwarfdump is tool used for additional dumping of ELF data which is sometimes in makefiles
+RUN apt-get install -y dwarfdump
+
+#Cleaning 
+RUN apt-get autoremove -y && \
+    apt-get clean && \
+    apt-get autoclean && \
+    rm -rf /var/cache/* && \
+    rm -rf /tmp/* && \
+    rm -rf /var/tmp/* && \
+    rm -rf /var/lib/apt/lists/*
+
+    
+    
+#{ Repo tool
+RUN curl http://commondatastorage.googleapis.com/git-repo-downloads/repo >/usr/local/bin/repo && \
+    chmod a+rwx /usr/local/bin/repo 
