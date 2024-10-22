@@ -1,5 +1,5 @@
 
-# *yocto-tools [Andrys Jiri, 2018.11.08, v0.76 ]*  
+# *yocto-tools [Andrys Jiri, 2024.10.19, v0.77 ]*  
 
  Author        : Jiri Andrys  
  Maintainer    : Jiri Andrys  
@@ -96,6 +96,7 @@ Yocto-tools has been tested on following systems:
  * Ubuntu 14.04(64bit)
  * Ubuntu 16.04(64bit with docker) 
  * Fedora 24(64bit)  
+ * WSL2: Ubuntu 22.04(64bit with docker)
 
 
 # 3. Getting Started 

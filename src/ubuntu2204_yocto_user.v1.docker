@@ -1,0 +1,64 @@
+# ===============================================================
+# NAME      :   ubuntu1804_yocto_user.v1.docker
+# AUTHOR    :   Andrys Jiri
+#
+# DEPENDENCIES:
+#               1) Binaries: Ubuntu 18.04
+#
+# DESCRIPTION:
+#             Yocto docker file.
+# 
+# ==============================================================
+FROM gandrys/ubuntu2204_yocto_base:v1
+
+LABEL Name="ubuntu2204_yocto_user.v1.docker" \
+      Author="Andrys Jiri" \
+      Maintainers="Andrys Jiri, andrys.jiri+project_yocto_docker@gmail.com" \
+      Date="2024.10.18" \
+      Version="0.1" \
+      Description="Yocto docker file"
+
+
+#{ Variables: docker build --build-arg <varname>=<value> 
+ARG USER_NAME
+ARG USER_UID
+ARG USER_GID
+
+ENV USER_NAME="${USER_NAME}"
+ENV USER_UID="${USER_UID}"
+ENV USER_GID="${USER_GID}"
+#}
+
+#{ Create new user with identical user name, uid, gid 
+RUN groupadd "${USER_NAME}" -g "${USER_GID}" && \
+    useradd -m "${USER_NAME}" -u "${USER_UID}" -g ${USER_GID} && \
+    usermod -aG sudo "${USER_NAME}"
+RUN echo yocto >>userpassword; echo yocto >>userpassword; echo "">>userpassword; \
+    cat userpassword | passwd "${USER_NAME}"
+#}
+
+#{ Copy/Download repo
+RUN mkdir -p "/home/${USER_NAME}/bin" && \
+    chown ${USER_NAME}:${USER_NAME} "/home/${USER_NAME}/bin"
+
+RUN cp /usr/local/bin/repo /home/${USER_NAME}/bin/ 
+
+#if we download new repo delete old repo in /usr/local/bin/repo
+RUN curl http://commondatastorage.googleapis.com/git-repo-downloads/repo >/home/${USER_NAME}/bin/repo && rm -f /usr/local/bin/repo ; echo "Ignore err" 
+
+RUN chmod a+x /home/${USER_NAME}/bin/repo && \
+    chown ${USER_NAME}:${USER_NAME} "/home/${USER_NAME}/bin/repo"
+
+RUN echo "PATH=\$PATH:/home/${USER_NAME}/bin" >>"/home/${USER_NAME}/.bashrc"
+#}
+
+RUN ln -s /opt/${USER_NAME}/works/.bash_history /home/${USER_NAME}/.bash_history
+RUN ln -s /opt/${USER_NAME}/works/.gitconfig /home/${USER_NAME}/.gitconfig
+
+
+ENV LC_ALL en_GB.UTF-8
+ENV LANG en_GB.UTF-8
+
+WORKDIR /opt/${USER_NAME}/works
+
+USER ${USER_NAME}
